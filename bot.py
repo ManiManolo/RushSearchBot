@@ -1,62 +1,105 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 from discord.ui import View, Button
-import os
-from flask import Flask
-import threading
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = "JE_BOT_TOKEN_HIER"
+GUILD_ID = 0  # Vul eventueel in voor snelle slash command registratie
 
-intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
+SEARCHING_CHANNEL_NAME = "🔎searching"
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# Webserver voor Render/UptimeRobot
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run_webserver():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run_webserver)
-    t.start()
-
-# Knoppen weergave
 class SearchView(View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(Button(label="Search", style=discord.ButtonStyle.primary, custom_id="search"))
-        self.add_item(Button(label="Found", style=discord.ButtonStyle.success, custom_id="found"))
-        self.add_item(Button(label="Next", style=discord.ButtonStyle.secondary, custom_id="next"))
+
+    @discord.ui.button(label="Search", style=discord.ButtonStyle.primary, custom_id="btn_search")
+    async def search_button(self, interaction: discord.Interaction, button: Button):
+        await handle_interaction(interaction, "🔎Search🔍")
+
+    @discord.ui.button(label="Found", style=discord.ButtonStyle.success, custom_id="btn_found")
+    async def found_button(self, interaction: discord.Interaction, button: Button):
+        await handle_interaction(interaction, "✅Found✅")
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="btn_next")
+    async def next_button(self, interaction: discord.Interaction, button: Button):
+        await handle_interaction(interaction, "⏭️next⏮️")
+
+async def handle_interaction(interaction: discord.Interaction, label: str):
+    await interaction.response.send_message(f"{label} {interaction.user.mention}", ephemeral=False)
+    bot = interaction.client
+    channel = interaction.channel
+
+    if bot.last_buttons_message:
+        try:
+            await bot.last_buttons_message.edit(view=None)
+        except:
+            pass
+
+    view = SearchView()
+    new_msg = await channel.send("Kies een optie:", view=view)
+    bot.last_buttons_message = new_msg
+
+class MyBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.last_buttons_message = None
+
+    async def setup_hook(self):
+        if GUILD_ID != 0:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+
+bot = MyBot()
 
 @bot.event
 async def on_ready():
-    print(f"Bot is ingelogd als {bot.user}")
+    print(f"Bot is ready als {bot.user}")
 
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
+@bot.tree.command(name="sendbuttons", description="Stuur de knoppen in het kanaal 🔎searching")
+async def send_buttons(interaction: discord.Interaction):
+    channel = None
+    for c in interaction.guild.text_channels:
+        if c.name == SEARCHING_CHANNEL_NAME:
+            channel = c
+            break
+    if not channel:
+        await interaction.response.send_message(f"Kan kanaal '{SEARCHING_CHANNEL_NAME}' niet vinden.", ephemeral=True)
         return
-    await message.channel.purge(limit=1)
-    await message.channel.send("Knoppen:", view=SearchView())
+
+    if bot.last_buttons_message:
+        try:
+            await bot.last_buttons_message.edit(view=None)
+        except:
+            pass
+
+    view = SearchView()
+    msg = await channel.send("Kies een optie:", view=view)
+    bot.last_buttons_message = msg
+    await interaction.response.send_message(f"Knoppenbericht gestuurd in {channel.mention}", ephemeral=True)
 
 @bot.event
-async def on_interaction(interaction: discord.Interaction):
-    if interaction.data["custom_id"] == "search":
-        await interaction.response.send_message(f"{interaction.user.mention} is searching...", delete_after=5)
-    elif interaction.data["custom_id"] == "found":
-        await interaction.response.send_message(f"{interaction.user.mention} has found it!", delete_after=5)
-    elif interaction.data["custom_id"] == "next":
-        await interaction.response.send_message(f"{interaction.user.mention} is next!", delete_after=5)
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.channel.name != SEARCHING_CHANNEL_NAME:
+        return
 
-    await interaction.message.edit(view=SearchView())
+    if bot.last_buttons_message:
+        try:
+            await bot.last_buttons_message.edit(view=None)
+        except:
+            pass
 
-if __name__ == "__main__":
-    keep_alive()
-    bot.run(TOKEN)
+        view = SearchView()
+        new_msg = await message.channel.send("Kies een optie:", view=view)
+        bot.last_buttons_message = new_msg
+
+    await bot.process_commands(message)
+
+bot.run(TOKEN)
