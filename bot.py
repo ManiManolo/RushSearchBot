@@ -1,91 +1,76 @@
+# bot.py
 import os
+import asyncio
 import discord
 from discord.ext import commands
-from discord import app_commands
-from aiohttp import web
-import asyncio
+from discord.ui import View, Button
+from flask import Flask
+import threading
+import requests
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_NAME = "🔎searching"
+TOKEN = os.getenv("DISCORD_TOKEN")  # Zorg dat deze in Render staat ingesteld
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))  # Zet je kanaal-ID hier of in Render env
 
+# ---- Discord Bot ----
 intents = discord.Intents.default()
-intents.messages = True
-intents.guilds = True
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-class SearchButtons(discord.ui.View):
+class SearchView(View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.last_message = None
+        self.add_item(Button(label="Searching", style=discord.ButtonStyle.green))
+        self.add_item(Button(label="Found", style=discord.ButtonStyle.blurple))
 
-    async def refresh_buttons(self, interaction: discord.Interaction):
-        channel = interaction.channel
-
-        # Oude knoppen verwijderen
-        if self.last_message:
-            try:
-                await self.last_message.delete()
-            except discord.NotFound:
-                pass
-
-        # Nieuwe knoppen plaatsen onderaan
-        self.last_message = await channel.send(view=SearchButtons())
-
-    @discord.ui.button(label="Search", style=discord.ButtonStyle.blurple)
-    async def search(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔎 Search gestart")
-        await self.refresh_buttons(interaction)
-
-    @discord.ui.button(label="Found", style=discord.ButtonStyle.green)
-    async def found(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("✅ Found gemeld")
-        await self.refresh_buttons(interaction)
-
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("⏭️ Volgende gezocht")
-        await self.refresh_buttons(interaction)
+async def send_new_buttons(channel):
+    """Verwijdert oude knoppen en stuurt nieuwe"""
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user and msg.components:
+            await msg.delete()
+    await channel.send(" ", view=SearchView())  # Los bericht, geen reply
 
 @bot.event
 async def on_ready():
-    print(f"Bot ingelogd als {bot.user}")
+    print(f"✅ Ingelogd als {bot.user}")
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        await send_new_buttons(channel)
 
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author == bot.user:
         return
+    channel = bot.get_channel(CHANNEL_ID)
+    if message.channel.id == CHANNEL_ID:
+        await send_new_buttons(channel)
 
-    if message.channel.name == CHANNEL_NAME:
-        # Oude knoppen verwijderen
-        async for msg in message.channel.history(limit=50):
-            if msg.components:
-                try:
-                    await msg.delete()
-                except discord.Forbidden:
-                    pass
+# ---- Mini Webserver ----
+app = Flask(__name__)
 
-        # Nieuwe knoppen plaatsen
-        await message.channel.send(view=SearchButtons())
+@app.route('/')
+def home():
+    return "Bot is alive!"
 
-    await bot.process_commands(message)
+def run_webserver():
+    app.run(host='0.0.0.0', port=8080)
 
-# Simpele webserver om de bot wakker te houden
-async def handle(request):
-    return web.Response(text="Bot is alive!")
-
-async def start_webserver():
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
+# ---- Zelf Pingen ----
+async def self_ping():
+    url = os.getenv("RENDER_EXTERNAL_URL")  # Render zet dit automatisch
+    if not url:
+        print("⚠️ Geen RENDER_EXTERNAL_URL gevonden, self-ping werkt niet.")
+        return
+    while True:
+        try:
+            requests.get(url)
+            print(f"🔄 Self-ping naar {url}")
+        except Exception as e:
+            print(f"Ping fout: {e}")
+        await asyncio.sleep(300)  # elke 5 minuten
 
 async def main():
-    # Start webserver en bot tegelijk
-    await start_webserver()
+    threading.Thread(target=run_webserver).start()
+    asyncio.create_task(self_ping())
     await bot.start(TOKEN)
 
 if __name__ == "__main__":
