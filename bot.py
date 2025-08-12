@@ -6,6 +6,7 @@ from discord.ext import commands
 from flask import Flask
 import threading
 import requests
+from datetime import datetime
 
 TOKEN = os.getenv("DISCORD_TOKEN")  # Zet deze in Render environment variables
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))  # Zet je kanaal-ID in Render env
@@ -20,26 +21,48 @@ class SearchButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def replace_buttons(self, interaction: discord.Interaction, text: str):
-        """Verwijder oude knoppen, stuur status en nieuwe knoppen"""
-        await interaction.message.delete()
-        await interaction.channel.send(text)
-        await send_new_buttons(interaction.channel)
-
     @discord.ui.button(label="Search", style=discord.ButtonStyle.green)
     async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await self.replace_buttons(interaction, f"{interaction.user.mention} 🕵️‍♂️ searching 🕵️‍♂️")
+
+        # Verwijder oude "next"-berichten van dezelfde gebruiker
+        async for msg in interaction.channel.history(limit=100):
+            if msg.author == bot.user and f"{interaction.user.mention}" in msg.content and "next" in msg.content.lower():
+                await msg.delete()
+
+        # Tijd in UTC
+        time_str = interaction.created_at.strftime("%H:%M UTC")
+        await interaction.channel.send(f"{time_str} {interaction.user.mention} 🕵️‍♂️ searching 🕵️‍♂️")
+
+        # Vernieuw knoppen
+        await send_new_buttons(interaction.channel)
 
     @discord.ui.button(label="Found", style=discord.ButtonStyle.blurple)
     async def found_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await self.replace_buttons(interaction, f"{interaction.user.mention} ✅ found ✅")
+
+        # Verwijder alle "search"-berichten van dezelfde gebruiker
+        async for msg in interaction.channel.history(limit=100):
+            if msg.author == bot.user and f"{interaction.user.mention}" in msg.content and "searching" in msg.content.lower():
+                await msg.delete()
+
+        # Tijd in UTC
+        time_str = interaction.created_at.strftime("%H:%M UTC")
+        await interaction.channel.send(f"{time_str} {interaction.user.mention} ✅ found ✅")
+
+        # Vernieuw knoppen
+        await send_new_buttons(interaction.channel)
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.gray)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await self.replace_buttons(interaction, f"{interaction.user.mention} ⏭️ next ⏮️")
+
+        # Tijd in UTC
+        time_str = interaction.created_at.strftime("%H:%M UTC")
+        await interaction.channel.send(f"{time_str} {interaction.user.mention} ⏭️ next ⏮️")
+
+        # Vernieuw knoppen
+        await send_new_buttons(interaction.channel)
 
 
 async def send_new_buttons(channel):
@@ -63,10 +86,7 @@ async def on_message(message):
     if message.author == bot.user:
         return
     if message.channel.id == CHANNEL_ID:
-        # Controleer of laatste bericht geen knoppen heeft
-        last_msg = await message.channel.history(limit=1).flatten()
-        if not last_msg[0].components:
-            await send_new_buttons(message.channel)
+        await send_new_buttons(message.channel)
 
 
 # ---- Mini Webserver ----
