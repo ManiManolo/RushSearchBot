@@ -20,20 +20,26 @@ class SearchButtons(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def replace_buttons(self, interaction: discord.Interaction, text: str):
+        """Verwijder oude knoppen, stuur status en nieuwe knoppen"""
+        await interaction.message.delete()
+        await interaction.channel.send(text)
+        await send_new_buttons(interaction.channel)
+
     @discord.ui.button(label="Search", style=discord.ButtonStyle.green)
     async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await interaction.channel.send(f"{interaction.user.mention}  🕵️‍♂️searching🕵️‍♂️")
+        await self.replace_buttons(interaction, f"{interaction.user.mention} 🕵️‍♂️ searching 🕵️‍♂️")
 
     @discord.ui.button(label="Found", style=discord.ButtonStyle.blurple)
     async def found_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await interaction.channel.send(f"{interaction.user.mention} ✅found✅")
+        await self.replace_buttons(interaction, f"{interaction.user.mention} ✅ found ✅")
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.gray)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await interaction.channel.send(f"{interaction.user.mention} ⏭️next⏮️")
+        await self.replace_buttons(interaction, f"{interaction.user.mention} ⏭️ next ⏮️")
 
 
 async def send_new_buttons(channel):
@@ -57,7 +63,10 @@ async def on_message(message):
     if message.author == bot.user:
         return
     if message.channel.id == CHANNEL_ID:
-        await send_new_buttons(message.channel)
+        # Controleer of laatste bericht geen knoppen heeft
+        last_msg = await message.channel.history(limit=1).flatten()
+        if not last_msg[0].components:
+            await send_new_buttons(message.channel)
 
 
 # ---- Mini Webserver ----
