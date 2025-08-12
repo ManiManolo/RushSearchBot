@@ -23,17 +23,17 @@ class SearchButtons(discord.ui.View):
     @discord.ui.button(label="Search", style=discord.ButtonStyle.green)
     async def search_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await interaction.channel.send(f"{interaction.user.mention} started searching")
+        await interaction.channel.send(f"{interaction.user.mention}  🕵️‍♂️searching🕵️‍♂️")
 
     @discord.ui.button(label="Found", style=discord.ButtonStyle.blurple)
     async def found_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await interaction.channel.send(f"{interaction.user.mention} reported found")
+        await interaction.channel.send(f"{interaction.user.mention} ✅found✅")
 
     @discord.ui.button(label="Next", style=discord.ButtonStyle.gray)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await interaction.channel.send(f"{interaction.user.mention} requested next")
+        await interaction.channel.send(f"{interaction.user.mention} ⏭️next⏮️")
 
 
 async def send_new_buttons(channel):
