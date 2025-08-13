@@ -47,7 +47,7 @@ class SearchButtons(discord.ui.View):
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ts = int(time.time())
-        await interaction.channel.send(f"<t:{ts}:t> {interaction.user.mention} ⏭️next⏮️")
+        await interaction.channel.send(f"🔶 <t:{ts}:t> {interaction.user.mention} ⏭️next⏮️")
         await send_new_buttons(interaction.channel)
 
 async def send_new_buttons(channel):
