@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: rushsearchbot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false # Zet dit later handmatig in de Render UI, nooit in de repo!
+      - key: PANEL_CHANNEL_ID
+        value: "1404949428040896613"
+      - key: BACKOFF_MIN
+        value: "300"
+      - key: BACKOFF_MAX
+        value: "900"
+      - key: PORT
+        value: "8080"
+      - key: KEEPALIVE_URL
+        value: "http://127.0.0.1:8080/"
+      - key: LOG_LEVEL
+        value: "INFO"
