@@ -23,12 +23,14 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing in environment variables.")
 
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))  # set this in Render
-SEARCH_TIMEOUT_SEC = int(os.getenv("SEARCH_TIMEOUT_SEC", "600"))  # 10 minutes
-HANDOVER_DELAY_SEC = int(os.getenv("HANDOVER_DELAY_SEC", "10"))    # 10 seconds
 
-# Backoff for login retries (seconds). Use env to tune during incidents.
-BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "300"))  # default: 5 min
-BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "900"))  # default: 15 min
+# Minimal mode: no timeouts, no countdowns
+SEARCH_TIMEOUT_SEC = None
+HANDOVER_DELAY_SEC = 0
+
+# Backoff for login retries (seconds)
+BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "300"))
+BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "900"))
 
 # ================== Minimal Webserver (for Render health) ==================
 app = Flask(__name__)
@@ -45,7 +47,7 @@ def run_webserver():
 # ================== Bot factory ==================
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
-    intents.message_content = True  # make sure this intent is enabled in Dev Portal too
+    intents.message_content = True  # enable in Dev Portal too
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
     # ---- Per-channel state ----
@@ -80,7 +82,7 @@ def create_bot() -> commands.Bot:
             self.add_item(ui.Button(label="🔁 Reset",  style=ButtonStyle.danger,    custom_id="rsb_reset"))
 
         async def interaction_check(self, interaction: Interaction) -> bool:
-            # Ensure interactions only from the panel's channel (safety)
+            # Only allow interactions from the same channel
             return interaction.channel and interaction.channel.id == self.channel_id
 
     # ---- Helpers ----
@@ -99,22 +101,23 @@ def create_bot() -> commands.Bot:
             parts.append("🟡 **Queue**: *empty*")
 
         parts.append("\n**Buttons:** 🔵 *Search* — ✅ *Found* — 🟡 *Next* — 🔁 *Reset*")
-        parts.append("*(Only the current searcher can press **Found**. Others use **Next** to enter the queue.)*")
         return "\n".join(parts)
 
-    async def send_panel(state: PanelState, *, fresh: bool = True) -> discord.Message:
+    def build_view(channel_id: int) -> SearchView:
+        return SearchView(channel_id)
+
+    async def edit_panel_message(inter: Interaction, state: PanelState):
+        """Fastest way: edit the interaction's message itself."""
+        content = build_status_text(state)
+        await inter.response.edit_message(content=content, view=build_view(state.channel_id))
+
+    async def send_or_edit_panel(state: PanelState) -> discord.Message:
+        """Used for initial placement or refresh outside interactions."""
         channel = state.channel()
         if not channel:
             raise RuntimeError(f"Channel {state.channel_id} not found or bot lacks access.")
-        view = SearchView(state.channel_id)
         content = build_status_text(state)
-
-        if fresh and state.panel_message_id:
-            try:
-                old = await channel.fetch_message(state.panel_message_id)
-                await old.delete()
-            except Exception:
-                pass
+        view = build_view(state.channel_id)
 
         if state.panel_message_id:
             try:
@@ -130,78 +133,34 @@ def create_bot() -> commands.Bot:
 
     async def start_search_for(state: PanelState, user_id: int):
         state.current_user_id = user_id
+        # No timers in minimal mode
         if state.search_task and not state.search_task.done():
             state.search_task.cancel()
         if state.handover_task and not state.handover_task.done():
             state.handover_task.cancel()
-        state.search_task = asyncio.create_task(search_timeout_runner(state))
-        await send_panel(state, fresh=True)
-
-    async def search_timeout_runner(state: PanelState):
-        try:
-            await asyncio.sleep(SEARCH_TIMEOUT_SEC)
-        except asyncio.CancelledError:
-            return
-        if state.current_user_id:
-            ch = state.channel()
-            if ch:
-                await ch.send(
-                    f"⏰ **Timeout** for <@{state.current_user_id}>. Switching in **{HANDOVER_DELAY_SEC}s**..."
-                )
-            await schedule_handover(state)
-
-    async def schedule_handover(state: PanelState):
-        if state.handover_task and not state.handover_task.done():
-            state.handover_task.cancel()
-        state.handover_task = asyncio.create_task(handover_runner(state))
-
-    async def handover_runner(state: PanelState):
-        try:
-            for remaining in range(HANDOVER_DELAY_SEC, 0, -1):
-                ch = state.channel()
-                if ch:
-                    await ch.send(f"⏳ Switching in **{remaining}**s...")
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            return
-        await perform_handover(state)
 
     async def perform_handover(state: PanelState):
         state.current_user_id = None
         user_to_start = state.queue.pop(0) if state.queue else None
         if user_to_start:
             await start_search_for(state, user_to_start)
-            ch = state.channel()
-            if ch:
-                await ch.send(f"➡️ **Now searching:** <@{user_to_start}>")
-        else:
-            if state.search_task and not state.search_task.done():
-                state.search_task.cancel()
-            await send_panel(state, fresh=True)
-            ch = state.channel()
-            if ch:
-                await ch.send("🟰 Queue is empty. Press **Search** to start.")
 
     # ---- Discord events ----
     @bot.event
     async def on_ready():
         try:
-            log.info("✅ Logged in as %s (id=%s, latency=%.3fs)", bot.user, bot.user.id, bot.latency)
+            log.info("✅ Logged in as %s (id=%s)", bot.user, bot.user.id)
         except Exception:
             log.info("✅ Logged in.")
-        # Auto-place the panel on startup if PANEL_CHANNEL_ID provided
         if PANEL_CHANNEL_ID:
-            channel = bot.get_channel(PANEL_CHANNEL_ID)
-            if isinstance(channel, discord.TextChannel):
+            ch = bot.get_channel(PANEL_CHANNEL_ID)
+            if isinstance(ch, discord.TextChannel):
                 try:
-                    state = get_or_create_state(channel.id)
-                    await send_panel(state, fresh=True)
-                    await channel.send("🎛️ Panel placed automatically after bot restart.")
-                    log.info("Panel placed automatically in channel %s", PANEL_CHANNEL_ID)
+                    state = get_or_create_state(ch.id)
+                    await send_or_edit_panel(state)   # place/refresh panel silently
+                    log.info("Panel ensured in channel %s", PANEL_CHANNEL_ID)
                 except Exception as e:
-                    log.error("Failed to auto-place panel: %r", e)
-            else:
-                log.warning("PANEL_CHANNEL_ID %s not found or not a text channel.", PANEL_CHANNEL_ID)
+                    log.error("Failed to ensure panel: %r", e)
 
     @bot.event
     async def on_interaction(interaction: Interaction):
@@ -210,20 +169,12 @@ def create_bot() -> commands.Bot:
         cid = interaction.data.get("custom_id")
         if cid not in {"rsb_search", "rsb_found", "rsb_next", "rsb_reset"}:
             return
-
         channel = interaction.channel
         if channel is None or not isinstance(channel, discord.TextChannel):
             return
 
-        # Debug logging so you can see clicks arriving
-        try:
-            log.info("🛰️ Interaction: user=%s (%s), channel=%s, custom_id=%s",
-                     interaction.user, getattr(interaction.user, "id", "?"),
-                     getattr(interaction.channel, "id", "?"), cid)
-        except Exception:
-            pass
-
         state = get_or_create_state(channel.id)
+
         if cid == "rsb_search":
             await handle_search(interaction, state)
         elif cid == "rsb_found":
@@ -233,92 +184,80 @@ def create_bot() -> commands.Bot:
         elif cid == "rsb_reset":
             await handle_reset(interaction, state)
 
-    # ---- Button handlers ----
+    # ---- Button handlers (no extra messages; only edit panel) ----
     async def handle_search(inter: Interaction, state: PanelState):
         user = inter.user
         async with state.lock:
             if state.current_user_id:
                 if state.current_user_id == user.id:
-                    await inter.response.send_message("You are already searching ✅", ephemeral=True)
+                    # already searching -> just refresh panel (no text)
+                    await edit_panel_message(inter, state)
                     return
                 if user.id not in state.queue:
                     state.queue.append(user.id)
-                await inter.response.send_message(
-                    "Someone is already searching. You were added to the queue 🟡",
-                    ephemeral=True,
-                )
-                await send_panel(state, fresh=True)
+                await edit_panel_message(inter, state)
                 return
 
             await start_search_for(state, user.id)
-            await inter.response.send_message(f"🔎 **{user.mention}** started searching!", ephemeral=True)
-            ch = state.channel()
-            if ch:
-                await ch.send(f"🔵 **Search started by {user.mention}**")
+            await edit_panel_message(inter, state)
 
     async def handle_found(inter: Interaction, state: PanelState):
         user = inter.user
-        if not state.current_user_id:
-            await inter.response.send_message("Nobody is searching right now.", ephemeral=True)
-            return
-        if state.current_user_id != user.id:
-            await inter.response.send_message("Only the current searcher can press **Found**.", ephemeral=True)
+        if not state.current_user_id or state.current_user_id != user.id:
+            # ignore silently (minimalistic)
+            try:
+                await inter.response.defer()  # acknowledge without message
+            except Exception:
+                pass
             return
 
-        await inter.response.send_message("🎉 Found! Switching soon.", ephemeral=True)
-        ch = state.channel()
-        if ch:
-            await ch.send(f"✅ **Found by {user.mention}** — switching in **{HANDOVER_DELAY_SEC}s**...")
-        await schedule_handover(state)
-        await send_panel(state, fresh=True)
+        await perform_handover(state)
+        await edit_panel_message(inter, state)
 
     async def handle_next(inter: Interaction, state: PanelState):
         user = inter.user
         if not state.current_user_id and not state.queue:
-            if user.id not in state.queue:
-                state.queue.append(user.id)
-            await inter.response.send_message(
-                f"You are first in line. Starting in **{HANDOVER_DELAY_SEC}s**...",
-                ephemeral=True,
-            )
-            await schedule_handover(state)
-            await send_panel(state, fresh=True)
+            # user becomes first immediately
+            state.queue.append(user.id)
+            await perform_handover(state)
+            await edit_panel_message(inter, state)
             return
 
-        if user.id in state.queue:
-            await inter.response.send_message("You are already in the queue 🟡", ephemeral=True)
-            return
-
-        state.queue.append(user.id)
-        await inter.response.send_message("Added to the queue 🟡", ephemeral=True)
-        await send_panel(state, fresh=True)
+        if user.id not in state.queue:
+            state.queue.append(user.id)
+        await edit_panel_message(inter, state)
 
     async def handle_reset(inter: Interaction, state: PanelState):
-        await inter.response.send_message("Reset received. Switching soon.", ephemeral=True)
-        ch = state.channel()
-        if ch:
-            await ch.send(f"🔁 Reset by {inter.user.mention} — switching in **{HANDOVER_DELAY_SEC}s**...")
-        await schedule_handover(state)
-        await send_panel(state, fresh=True)
+        # Clear current and step to next if any
+        state.current_user_id = None
+        await perform_handover(state)
+        await edit_panel_message(inter, state)
 
-    # ---- Commands ----
+    # ---- Commands (silent/minimal) ----
     @bot.command()
     async def panel(ctx: commands.Context):
-        """Place or refresh the panel in this channel."""
+        """Place or refresh the panel in this channel (silent)."""
         state = get_or_create_state(ctx.channel.id)
-        await send_panel(state, fresh=True)
-        await ctx.send("🎛️ Panel placed/refreshed.", delete_after=5)
+        await send_or_edit_panel(state)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
 
     @bot.command()
     async def status(ctx: commands.Context):
-        """Show current status and queue."""
+        """Show current status by refreshing the panel only."""
         state = get_or_create_state(ctx.channel.id)
-        await ctx.send(build_status_text(state))
+        await send_or_edit_panel(state)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
 
     @bot.command()
     @commands.has_permissions(manage_messages=True)
     async def resetqueue(ctx: commands.Context):
-        """Clear queue and reset status."""
+        """Clear queue and reset status (silent)."""
         state = get_or_create_state(ctx.channel.id)
         state.queue.clear()
         state.current_user_id = None
@@ -326,8 +265,11 @@ def create_bot() -> commands.Bot:
             state.search_task.cancel()
         if state.handover_task and not state.handover_task.done():
             state.handover_task.cancel()
-        await send_panel(state, fresh=True)
-        await ctx.send("🧹 Queue cleared and status reset.")
+        await send_or_edit_panel(state)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
 
     return bot
 
@@ -338,11 +280,10 @@ async def run_with_backoff(token: str):
         bot = create_bot()  # fresh instance per attempt
         try:
             log.info("🔐 Starting Discord login...")
-            await bot.start(token)  # login + connect; returns when disconnected
+            await bot.start(token)  # login + connect
             break
         except discord.HTTPException as e:
             status = getattr(e, "status", None)
-            # Respect Retry-After if provided
             retry_after = None
             try:
                 if hasattr(e, "response") and e.response is not None:
@@ -368,7 +309,6 @@ async def run_with_backoff(token: str):
             log.error("Unexpected error during start: %r", e)
             await asyncio.sleep(30)
         finally:
-            # Always cleanup
             try:
                 await bot.close()
             except Exception:
@@ -381,10 +321,7 @@ async def run_with_backoff(token: str):
 
 # ================== Main ==================
 async def main():
-    # Start Flask on a background thread so it doesn't block the event loop
-    t = threading.Thread(target=run_webserver, daemon=True)
-    t.start()
-
+    threading.Thread(target=run_webserver, daemon=True).start()
     await run_with_backoff(TOKEN)
 
 if __name__ == "__main__":
