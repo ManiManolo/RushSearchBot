@@ -27,6 +27,10 @@ HANDOVER_DELAY_SEC = int(os.getenv("HANDOVER_DELAY_SEC", "10"))    # 10 seconds
 ENABLE_SELF_PING = os.getenv("SELF_PING", "true").lower() not in {"0", "false", "no"}
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))         # set this on Render
 
+# Backoff tuning
+BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "30"))   # min seconds after 429
+BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "600"))  # cap at 10 minutes
+
 # ================== Discord Setup =============
 intents = discord.Intents.default()
 intents.message_content = True  # Ensure Message Content Intent is enabled in Dev Portal
@@ -283,31 +287,6 @@ async def handle_reset(inter: Interaction, state: PanelState):
     await schedule_handover(state)
     await send_panel(state, fresh=True)
 
-# ================== Commands ====================
-@bot.command()
-async def panel(ctx: commands.Context):
-    state = get_or_create_state(ctx.channel.id)
-    await send_panel(state, fresh=True)
-    await ctx.send("🎛️ Panel placed/refreshed.", delete_after=5)
-
-@bot.command()
-async def status(ctx: commands.Context):
-    state = get_or_create_state(ctx.channel.id)
-    await ctx.send(build_status_text(state))
-
-@bot.command()
-@commands.has_permissions(manage_messages=True)
-async def resetqueue(ctx: commands.Context):
-    state = get_or_create_state(ctx.channel.id)
-    state.queue.clear()
-    state.current_user_id = None
-    if state.search_task and not state.search_task.done():
-        state.search_task.cancel()
-    if state.handover_task and not state.handover_task.done():
-        state.handover_task.cancel()
-    await send_panel(state, fresh=True)
-    await ctx.send("🧹 Queue cleared and status reset.")
-
 # ================== Webserver (Render) ==========
 app = Flask(__name__)
 
@@ -334,37 +313,44 @@ async def self_ping():
 
 # ================== Main (robust login) ========================
 async def main():
-    # Start the Flask webserver in the background
+    # Start Flask in background
     t = threading.Thread(target=run_webserver, daemon=True)
     t.start()
     if ENABLE_SELF_PING:
         asyncio.create_task(self_ping())
 
-    base = 5      # start backoff (seconds)
-    cap = 300     # max backoff (seconds)
     attempt = 0
-
     while True:
         try:
             log.info("🔐 Starting Discord login...")
-            await bot.start(TOKEN)
-            break  # normally unreachable (bot.start blocks)
+
+            # Step 1: login (creates HTTP session)
+            await bot.login(TOKEN)
+
+            # Step 2: connect gateway (blocks until disconnect)
+            await bot.connect(reconnect=False)
+            break  # normally unreachable while running
         except discord.HTTPException as e:
-            # Exponential backoff with jitter on 429
-            if getattr(e, "status", None) == 429:
-                delay = min(cap, base * (2 ** attempt))
-                jitter = random.uniform(0, delay)
+            status = getattr(e, "status", None)
+            if status == 429:
+                # Exponential backoff with jitter and a minimum floor
+                delay_cap = min(BACKOFF_MAX, max(BACKOFF_MIN, 5 * (2 ** attempt)))
+                delay = random.uniform(BACKOFF_MIN, delay_cap)
                 attempt += 1
-                log.warning("⚠️ Received 429 (rate limited). Backing off for %.1f seconds before retrying.", jitter)
-                await asyncio.sleep(jitter)
+                log.warning("⚠️ Received 429 (rate limited). Backing off for %.1f seconds before retrying.", delay)
+                await asyncio.sleep(delay)
             else:
-                log.error("HTTPException during login: %r", e)
-                await asyncio.sleep(10)
+                log.error("HTTPException during login/connect (status=%s): %r", status, e)
+                await asyncio.sleep(15)
         except Exception as e:
-            log.error("Unexpected error during login: %r", e)
-            await asyncio.sleep(10)
+            log.error("Unexpected error during login/connect: %r", e)
+            await asyncio.sleep(15)
         finally:
-            # Close leftover HTTP session to avoid 'Unclosed client session'
+            # Clean up any leftover session/sockets to avoid "Unclosed client session"
+            try:
+                await bot.close()  # also closes bot.http.session
+            except Exception:
+                pass
             try:
                 if hasattr(bot, "http") and getattr(bot.http, "session", None):
                     await bot.http.close()
