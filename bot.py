@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import threading
+import random
 from typing import Dict, List, Optional
 
 import discord
@@ -163,9 +164,9 @@ class SearchView(ui.View):
         super().__init__(timeout=None)  # persistent view
         self.channel_id = channel_id
         self.add_item(ui.Button(label="🔵 Search", style=ButtonStyle.primary, custom_id="rsb_search"))
-        self.add_item(ui.Button(label="✅ Found", style=ButtonStyle.success, custom_id="rsb_found"))
-        self.add_item(ui.Button(label="🟡 Next", style=ButtonStyle.secondary, custom_id="rsb_next"))
-        self.add_item(ui.Button(label="🔁 Reset", style=ButtonStyle.danger, custom_id="rsb_reset"))
+        self.add_item(ui.Button(label="✅ Found",  style=ButtonStyle.success,  custom_id="rsb_found"))
+        self.add_item(ui.Button(label="🟡 Next",   style=ButtonStyle.secondary, custom_id="rsb_next"))
+        self.add_item(ui.Button(label="🔁 Reset",  style=ButtonStyle.danger,    custom_id="rsb_reset"))
 
     async def interaction_check(self, interaction: Interaction) -> bool:
         return interaction.channel and interaction.channel.id == self.channel_id
@@ -331,36 +332,44 @@ async def self_ping():
             log.debug("Self-ping error: %r", e)
         await asyncio.sleep(300)
 
-# ================== Main (with backoff) =========
+# ================== Main (robust login) ========================
 async def main():
-    # Start webserver in background
+    # Start the Flask webserver in the background
     t = threading.Thread(target=run_webserver, daemon=True)
     t.start()
     if ENABLE_SELF_PING:
         asyncio.create_task(self_ping())
 
-    # Robust login loop with exponential backoff (to survive 429/Cloudflare)
-    base = 5      # seconds
-    cap = 300     # max backoff (5 min)
+    base = 5      # start backoff (seconds)
+    cap = 300     # max backoff (seconds)
     attempt = 0
 
     while True:
         try:
             log.info("🔐 Starting Discord login...")
             await bot.start(TOKEN)
-            break  # normally unreachable; bot.start blocks
+            break  # normally unreachable (bot.start blocks)
         except discord.HTTPException as e:
+            # Exponential backoff with jitter on 429
             if getattr(e, "status", None) == 429:
                 delay = min(cap, base * (2 ** attempt))
+                jitter = random.uniform(0, delay)
                 attempt += 1
-                log.warning("⚠️ Received 429 (rate limited). Backing off for %s seconds before retrying.", delay)
-                await asyncio.sleep(delay)
-                continue
-            log.error("HTTPException during login: %r", e)
-            await asyncio.sleep(10)
+                log.warning("⚠️ Received 429 (rate limited). Backing off for %.1f seconds before retrying.", jitter)
+                await asyncio.sleep(jitter)
+            else:
+                log.error("HTTPException during login: %r", e)
+                await asyncio.sleep(10)
         except Exception as e:
             log.error("Unexpected error during login: %r", e)
             await asyncio.sleep(10)
+        finally:
+            # Close leftover HTTP session to avoid 'Unclosed client session'
+            try:
+                if hasattr(bot, "http") and getattr(bot.http, "session", None):
+                    await bot.http.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     try:
