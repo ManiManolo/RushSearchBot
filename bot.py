@@ -1,8 +1,7 @@
 # bot.py
 import os
-import asyncio
-import discord
 import time
+import discord
 from discord.ext import commands
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -11,7 +10,6 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 
 class SearchButtons(discord.ui.View):
     def __init__(self):
@@ -46,14 +44,12 @@ class SearchButtons(discord.ui.View):
         await interaction.channel.send(f"🔶 <t:{ts}:t> {interaction.user.mention} ⏭️next⏮️")
         await send_new_buttons(interaction.channel)
 
-
 async def send_new_buttons(channel):
     """Verwijder oude knoppen en stuur nieuwe"""
     async for msg in channel.history(limit=50):
         if msg.author == bot.user and msg.components:
             await msg.delete()
     await channel.send(" ", view=SearchButtons())
-
 
 @bot.event
 async def on_ready():
@@ -62,7 +58,6 @@ async def on_ready():
     if channel:
         await send_new_buttons(channel)
 
-
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -70,6 +65,4 @@ async def on_message(message):
     if message.channel.id == CHANNEL_ID:
         await send_new_buttons(message.channel)
 
-
-if __name__ == "__main__":
-    asyncio.run(bot.start(TOKEN))
+bot.run(TOKEN)
