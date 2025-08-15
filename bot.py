@@ -178,7 +178,7 @@ def make_bot() -> commands.Bot:
             )
             st.thread_id = th.id
             # create the summary message once
-            content = "📜 **Log (last 20)**\n*(empty)*"
+            content = "📜 **Log (last 50)**\n*(empty)*"
             msg = await th.send(content)
             st.thread_summary_message_id = msg.id
             return th
@@ -187,12 +187,12 @@ def make_bot() -> commands.Bot:
             return None
 
     async def update_log_summary(st: PanelState):
-        """Edit a single summary message in the log thread to show last 20."""
+        """Edit a single summary message in the log thread to show last 50."""
         th = await ensure_log_thread(st)
         if not th:
             return
         # build text newest first
-        last = st.logbook[-20:][::-1]
+        last = st.logbook[-50:][::-1]
         if last:
             body = "\n".join(f"• <@{uid}> — <t:{ts}:t>" for uid, ts in last)
             text = f"📜 **Log (last 20)**\n{body}"
@@ -298,8 +298,8 @@ def make_bot() -> commands.Bot:
             if st.current_user_id and st.current_user_id == user.id:
                 ts = int(discord.utils.utcnow().timestamp())
                 st.logbook.append((user.id, ts))
-                if len(st.logbook) > 20:
-                    st.logbook = st.logbook[-20:]
+                if len(st.logbook) > 50:
+                    st.logbook = st.logbook[-50:]
                 await stop_only(st)
                 await update_log_summary(st)  # <-- update thread
             await edit_panel_from_interaction(inter, st)
