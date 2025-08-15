@@ -1,17 +1,15 @@
-# bot.py
+# bot.py (Worker variant - no Flask/HTTP)
 import os
 import asyncio
 import logging
-import threading
 import random
 from typing import Dict, List, Optional
 
 import discord
 from discord.ext import commands
 from discord import ui, ButtonStyle, Interaction
-from flask import Flask
 
-# ================== Config & Logging ==================
+# ===== Logging =====
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -23,30 +21,14 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing in environment variables.")
 
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
-
-# Minimal mode: no countdowns / no auto-timeouts
 BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "300"))
 BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "900"))
 
-# ================== Minimal Webserver (for Render health) ==================
-app = Flask(__name__)
-
-@app.get("/")
-def health():
-    return "ok", 200
-
-def run_webserver():
-    port = int(os.environ.get("PORT", "8080"))
-    log.info("🌐 Starting webserver on 0.0.0.0:%s", port)
-    app.run(host="0.0.0.0", port=port)
-
-# ================== Bot factory ==================
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-    # ---- Per-channel state ----
     class PanelState:
         def __init__(self, channel_id: int):
             self.channel_id: int = channel_id
@@ -60,15 +42,14 @@ def create_bot() -> commands.Bot:
 
     PANELS: Dict[int, PanelState] = {}
 
-    def get_or_create_state(channel_id: int) -> PanelState:
+    def state_for(channel_id: int) -> PanelState:
         if channel_id not in PANELS:
             PANELS[channel_id] = PanelState(channel_id)
         return PANELS[channel_id]
 
-    # ---- UI view ----
     class SearchView(ui.View):
         def __init__(self, channel_id: int):
-            super().__init__(timeout=None)  # persistent view
+            super().__init__(timeout=None)
             self.channel_id = channel_id
             self.add_item(ui.Button(label="🔵 Search", style=ButtonStyle.primary,  custom_id="rsb_search"))
             self.add_item(ui.Button(label="✅ Found",  style=ButtonStyle.success,  custom_id="rsb_found"))
@@ -78,54 +59,43 @@ def create_bot() -> commands.Bot:
         async def interaction_check(self, interaction: Interaction) -> bool:
             return interaction.channel and interaction.channel.id == self.channel_id
 
-    # ---- Helpers ----
-    def build_status_text(state: PanelState) -> str:
+    def panel_text(st: PanelState) -> str:
         lines = []
-        if state.current_user_id:
-            lines.append(f"🔎 **Searching**: <@{state.current_user_id}>")
-        else:
-            lines.append("🟦 **Searching**: *nobody*")
-
-        if state.queue:
-            preview = " → ".join(f"<@{uid}>" for uid in state.queue[:10])
-            more = f" (+{len(state.queue)-10})" if len(state.queue) > 10 else ""
+        lines.append(f"🔎 **Searching**: <@{st.current_user_id}>" if st.current_user_id else "🟦 **Searching**: *nobody*")
+        if st.queue:
+            preview = " → ".join(f"<@{uid}>" for uid in st.queue[:10])
+            more = f" (+{len(st.queue)-10})" if len(st.queue) > 10 else ""
             lines.append(f"🟡 **Queue**: {preview}{more}")
         else:
             lines.append("🟡 **Queue**: *empty*")
-
         return "\n".join(lines)
 
-    def view_for(channel_id: int) -> SearchView:
-        return SearchView(channel_id)
-
-    async def edit_panel_from_interaction(inter: Interaction, state: PanelState):
-        await inter.response.edit_message(content=build_status_text(state), view=view_for(state.channel_id))
-
-    async def ensure_panel(state: PanelState) -> discord.Message:
-        ch = state.channel()
+    async def ensure_panel(st: PanelState):
+        ch = st.channel()
         if not ch:
-            raise RuntimeError(f"Channel {state.channel_id} not found or bot lacks access.")
-        if state.panel_message_id:
-            try:
-                msg = await ch.fetch_message(state.panel_message_id)
-                await msg.edit(content=build_status_text(state), view=view_for(state.channel_id))
-                return msg
-            except Exception:
-                pass
-        msg = await ch.send(build_status_text(state), view=view_for(state.channel_id))
-        state.panel_message_id = msg.id
-        return msg
+            raise RuntimeError(f"Channel {st.channel_id} not found or access denied.")
+        try:
+            if st.panel_message_id:
+                msg = await ch.fetch_message(st.panel_message_id)
+                await msg.edit(content=panel_text(st), view=SearchView(st.channel_id))
+                return
+        except Exception:
+            pass
+        msg = await ch.send(panel_text(st), view=SearchView(st.channel_id))
+        st.panel_message_id = msg.id
 
-    async def start_search_for(state: PanelState, user_id: int):
-        state.current_user_id = user_id
+    async def edit_from_interaction(inter: Interaction, st: PanelState):
+        await inter.response.edit_message(content=panel_text(st), view=SearchView(st.channel_id))
 
-    async def perform_handover(state: PanelState):
-        state.current_user_id = None
-        if state.queue:
-            next_user = state.queue.pop(0)
-            await start_search_for(state, next_user)
+    async def start_for(st: PanelState, user_id: int):
+        st.current_user_id = user_id
 
-    # ---- Events ----
+    async def handover(st: PanelState):
+        st.current_user_id = None
+        if st.queue:
+            nxt = st.queue.pop(0)
+            await start_for(st, nxt)
+
     @bot.event
     async def on_ready():
         log.info("✅ Logged in as %s (id=%s)", getattr(bot.user, "name", "?"), getattr(bot.user, "id", "?"))
@@ -133,81 +103,73 @@ def create_bot() -> commands.Bot:
             ch = bot.get_channel(PANEL_CHANNEL_ID)
             if isinstance(ch, discord.TextChannel):
                 try:
-                    state = get_or_create_state(ch.id)
-                    await ensure_panel(state)
+                    await ensure_panel(state_for(ch.id))
                     log.info("Panel ensured in channel %s", PANEL_CHANNEL_ID)
                 except Exception as e:
-                    log.error("Failed to ensure panel: %r", e)
+                    log.error("Ensure panel failed: %r", e)
 
     @bot.event
     async def on_interaction(inter: Interaction):
-        if interaction.type != discord.InteractionType.component:
+        if inter.type != discord.InteractionType.component:
             return
-        cid = interaction.data.get("custom_id")
+        cid = inter.data.get("custom_id")
         if cid not in {"rsb_search", "rsb_found", "rsb_next", "rsb_reset"}:
             return
-        ch = interaction.channel
+        ch = inter.channel
         if not isinstance(ch, discord.TextChannel):
             return
-
-        state = get_or_create_state(ch.id)
+        st = state_for(ch.id)
 
         if cid == "rsb_search":
-            await handle_search(interaction, state)
+            await handle_search(inter, st)
         elif cid == "rsb_found":
-            await handle_found(interaction, state)
+            await handle_found(inter, st)
         elif cid == "rsb_next":
-            await handle_next(interaction, state)
+            await handle_next(inter, st)
         elif cid == "rsb_reset":
-            await handle_reset(interaction, state)
+            await handle_reset(inter, st)
 
-    # ---- Button handlers (no extra messages; panel-only updates) ----
-    async def handle_search(inter: Interaction, state: PanelState):
+    async def handle_search(inter: Interaction, st: PanelState):
         user = inter.user
-        async with state.lock:
-            if state.current_user_id:
-                if state.current_user_id != user.id and user.id not in state.queue:
-                    state.queue.append(user.id)
+        async with st.lock:
+            if st.current_user_id:
+                if user.id not in st.queue and st.current_user_id != user.id:
+                    st.queue.append(user.id)
             else:
-                await start_search_for(state, user.id)
-            await edit_panel_from_interaction(inter, state)
+                await start_for(st, user.id)
+            await edit_from_interaction(inter, st)
 
-    async def handle_found(inter: Interaction, state: PanelState):
+    async def handle_found(inter: Interaction, st: PanelState):
         user = inter.user
-        # Only current searcher can finish; others are ignored silently
-        if state.current_user_id and state.current_user_id == user.id:
-            await perform_handover(state)
-            await edit_panel_from_interaction(inter, state)
+        if st.current_user_id and st.current_user_id == user.id:
+            await handover(st)
+            await edit_from_interaction(inter, st)
         else:
             try:
                 await inter.response.defer()
             except Exception:
                 pass
 
-    async def handle_next(inter: Interaction, state: PanelState):
+    async def handle_next(inter: Interaction, st: PanelState):
         user = inter.user
-        async with state.lock:
-            if not state.current_user_id and not state.queue:
-                # user becomes current immediately
-                await start_search_for(state, user.id)
+        async with st.lock:
+            if not st.current_user_id and not st.queue:
+                await start_for(st, user.id)
             else:
-                if user.id not in state.queue:
-                    state.queue.append(user.id)
-            await edit_panel_from_interaction(inter, state)
+                if user.id not in st.queue:
+                    st.queue.append(user.id)
+            await edit_from_interaction(inter, st)
 
-    async def handle_reset(inter: Interaction, state: PanelState):
-        # Anyone can reset: clears ONLY the current searcher, then moves to next if any
-        async with state.lock:
-            if state.current_user_id:
-                await perform_handover(state)
-            # If nobody was searching, this is effectively a no-op; we still refresh the panel
-            await edit_panel_from_interaction(inter, state)
+    async def handle_reset(inter: Interaction, st: PanelState):
+        async with st.lock:
+            if st.current_user_id:
+                await handover(st)  # anyone can reset current searcher
+            await edit_from_interaction(inter, st)
 
-    # ---- Commands (silent) ----
     @bot.command()
     async def panel(ctx: commands.Context):
-        state = get_or_create_state(ctx.channel.id)
-        await ensure_panel(state)
+        st = state_for(ctx.channel.id)
+        await ensure_panel(st)
         try:
             await ctx.message.delete()
         except Exception:
@@ -216,10 +178,10 @@ def create_bot() -> commands.Bot:
     @bot.command()
     @commands.has_permissions(manage_messages=True)
     async def resetqueue(ctx: commands.Context):
-        state = get_or_create_state(ctx.channel.id)
-        state.queue.clear()
-        state.current_user_id = None
-        await ensure_panel(state)
+        st = state_for(ctx.channel.id)
+        st.queue.clear()
+        st.current_user_id = None
+        await ensure_panel(st)
         try:
             await ctx.message.delete()
         except Exception:
@@ -227,13 +189,12 @@ def create_bot() -> commands.Bot:
 
     return bot
 
-# ================== Robust startup with backoff ==================
 async def run_with_backoff(token: str):
     attempt = 0
     while True:
         bot = create_bot()
         try:
-            log.info("🔐 Starting Discord login...")
+            logging.getLogger("rushsearchbot").info("🔐 Starting Discord login...")
             await bot.start(token)
             break
         except discord.HTTPException as e:
@@ -247,16 +208,16 @@ async def run_with_backoff(token: str):
             except Exception:
                 pass
             if status == 429 or retry_after is not None:
-                delay_cap = min(BACKOFF_MAX, max(BACKOFF_MIN, 5 * (2 ** attempt)))
-                delay = (retry_after + random.uniform(0, 10)) if retry_after is not None else random.uniform(BACKOFF_MIN, delay_cap)
+                cap = min(BACKOFF_MAX, max(BACKOFF_MIN, 5 * (2 ** attempt)))
+                delay = (retry_after + random.uniform(0, 10)) if retry_after is not None else random.uniform(BACKOFF_MIN, cap)
                 attempt += 1
-                log.warning("⚠️ 429 rate limited. Sleeping for %.1f seconds (Retry-After=%s).", delay, retry_after)
+                logging.getLogger("rushsearchbot").warning("⚠️ 429 rate limited. Sleeping for %.1f s (Retry-After=%s).", delay, retry_after)
                 await asyncio.sleep(delay)
             else:
-                log.error("HTTPException during start (status=%s): %r", status, e)
+                logging.getLogger("rushsearchbot").error("HTTPException during start (status=%s): %r", status, e)
                 await asyncio.sleep(30)
         except Exception as e:
-            log.error("Unexpected error during start: %r", e)
+            logging.getLogger("rushsearchbot").error("Unexpected error during start: %r", e)
             await asyncio.sleep(30)
         finally:
             try:
@@ -269,13 +230,8 @@ async def run_with_backoff(token: str):
             except Exception:
                 pass
 
-# ================== Main ==================
-async def main():
-    threading.Thread(target=run_webserver, daemon=True).start()
-    await run_with_backoff(TOKEN)
-
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run_with_backoff(TOKEN))
     except KeyboardInterrupt:
-        log.info("🛑 Stop requested, shutting down...")
+        logging.getLogger("rushsearchbot").info("🛑 Shutting down...")
