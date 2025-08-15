@@ -1,4 +1,4 @@
-# bot.py — RushSearchBot (Background Worker, no pytz, free-start, collapsible log)
+# bot.py — RushSearchBot: panel + separate thread log (last 20)
 import os
 import asyncio
 import logging
@@ -8,37 +8,41 @@ import discord
 from discord.ext import commands
 from discord import ui, ButtonStyle, Interaction
 
-# ===== Logging =====
+# ---------- logging ----------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("rushsearchbot")
 
-# ===== Environment =====
+# ---------- env ----------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing in environment variables.")
-
+    raise RuntimeError("DISCORD_TOKEN missing")
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
 
-# ===== Bot setup =====
+# ---------- bot ----------
 def make_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.guilds = True
     intents.messages = True
-    intents.message_content = True  # nodig voor on_message
+    intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-    # ---------- Per-channel state ----------
+    # ----- state per channel -----
     class PanelState:
         def __init__(self, channel_id: int):
             self.channel_id: int = channel_id
             self.panel_message_id: Optional[int] = None
             self.current_user_id: Optional[int] = None
-            self.current_started_ts: Optional[int] = None  # UNIX seconds
+            self.current_started_ts: Optional[int] = None  # unix seconds
             self.queue: List[int] = []
-            self.logbook: List[Tuple[int, int]] = []  # [(user_id, unix_ts)] max 20
+            self.logbook: List[Tuple[int, int]] = []  # (user_id, ts) last 20
+
+            # log thread data
+            self.thread_id: Optional[int] = None
+            self.thread_summary_message_id: Optional[int] = None
+
             self.lock = asyncio.Lock()
 
         def channel(self) -> Optional[discord.TextChannel]:
@@ -47,15 +51,15 @@ def make_bot() -> commands.Bot:
 
     PANELS: Dict[int, PanelState] = {}
 
-    def state_for(channel_id: int) -> PanelState:
-        if channel_id not in PANELS:
-            PANELS[channel_id] = PanelState(channel_id)
-        return PANELS[channel_id]
+    def state_for(cid: int) -> PanelState:
+        if cid not in PANELS:
+            PANELS[cid] = PanelState(cid)
+        return PANELS[cid]
 
-    # ---------- UI ----------
+    # ----- UI -----
     class SearchView(ui.View):
         def __init__(self, channel_id: int):
-            super().__init__(timeout=None)  # persistent
+            super().__init__(timeout=None)
             self.channel_id = channel_id
             self.add_item(ui.Button(label="🔵 Search", style=ButtonStyle.primary,  custom_id="rsb_search"))
             self.add_item(ui.Button(label="✅ Found",  style=ButtonStyle.success,  custom_id="rsb_found"))
@@ -65,50 +69,35 @@ def make_bot() -> commands.Bot:
         async def interaction_check(self, interaction: Interaction) -> bool:
             return interaction.channel and interaction.channel.id == self.channel_id
 
-    # ---------- Panel helpers ----------
+    # ----- panel rendering -----
     def panel_text(st: PanelState) -> str:
         lines: List[str] = []
-
         # Searching
         if st.current_user_id:
             if st.current_started_ts:
-                lines.append(
-                    f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t>"
-                )
+                lines.append(f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t>")
             else:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}>")
         else:
             lines.append("🟦 **Searching**: *nobody*")
 
-        # Lege regel tussen Searching en Queue
+        # empty line between sections
         lines.append("")
 
-        # Queue (elke user op nieuwe regel)
+        # Queue (each on new line)
         if st.queue:
             queue_lines = "\n".join(f"• <@{uid}>" for uid in st.queue)
             lines.append(f"🟡 **Queue**:\n{queue_lines}")
         else:
             lines.append("🟡 **Queue**:\n*empty*")
 
-        # Lege regel tussen Queue en Logboek
-        lines.append("")
-
-        # Logboek (laatste 20, spoiler = inklapbaar)
-        if st.logbook:
-            # nieuwste bovenaan
-            last = st.logbook[-20:][::-1]
-            log_lines = "\n".join(f"• <@{uid}> — <t:{ts}:t>" for uid, ts in last)
-            lines.append(f"📜 **Log** (last 20):\n||{log_lines}||")
-        else:
-            lines.append("📜 **Log** (last 20):\n||*empty*||")
-
+        # no log here anymore (moved to thread)
         return "\n".join(lines)
 
     async def send_panel_bottom(st: PanelState):
-        """Post het panel onderaan; verwijder oud paneel als dat er is."""
         ch = st.channel()
         if not ch:
-            raise RuntimeError(f"Channel {st.channel_id} not found or access denied.")
+            raise RuntimeError(f"Channel {st.channel_id} not found")
         if st.panel_message_id:
             try:
                 old = await ch.fetch_message(st.panel_message_id)
@@ -117,10 +106,11 @@ def make_bot() -> commands.Bot:
                 pass
         msg = await ch.send(panel_text(st), view=SearchView(st.channel_id))
         st.panel_message_id = msg.id
+        # make sure log thread exists
+        await ensure_log_thread(st)
         return msg
 
     async def ensure_panel(st: PanelState):
-        """Als panel bestaat: edit; anders: nieuw plaatsen onderaan."""
         ch = st.channel()
         if not ch:
             return
@@ -128,13 +118,13 @@ def make_bot() -> commands.Bot:
             try:
                 msg = await ch.fetch_message(st.panel_message_id)
                 await msg.edit(content=panel_text(st), view=SearchView(st.channel_id))
+                await ensure_log_thread(st)
                 return
             except Exception:
                 pass
         await send_panel_bottom(st)
 
     async def edit_panel_from_interaction(inter: Interaction, st: PanelState):
-        """Updaten via interaction; fallback = repost onderaan."""
         try:
             await inter.response.edit_message(content=panel_text(st), view=SearchView(st.channel_id))
         except discord.NotFound:
@@ -149,38 +139,114 @@ def make_bot() -> commands.Bot:
             except Exception:
                 pass
 
-    # ---------- State ops ----------
+    # ----- log thread helpers -----
+    LOG_THREAD_NAME = "rushsearch-log"
+
+    async def ensure_log_thread(st: PanelState) -> Optional[discord.Thread]:
+        """Find or create the log thread in the panel channel; cache IDs."""
+        ch = st.channel()
+        if not ch:
+            return None
+
+        # 1) if we have an id, try fetch
+        if st.thread_id:
+            th = bot.get_channel(st.thread_id)
+            if isinstance(th, discord.Thread):
+                if th.archived:
+                    try:
+                        await th.edit(archived=False, locked=False)
+                    except Exception:
+                        pass
+                return th
+            # else fall through and try find/create
+
+        # 2) try to find an active thread with the right name
+        try:
+            for th in ch.threads:  # active threads
+                if isinstance(th, discord.Thread) and th.name == LOG_THREAD_NAME:
+                    st.thread_id = th.id
+                    return th
+        except Exception:
+            pass
+
+        # 3) create a public thread not tied to a starter message
+        try:
+            th = await ch.create_thread(
+                name=LOG_THREAD_NAME,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=4320  # 3 days, re-open when we post
+            )
+            st.thread_id = th.id
+            # create the summary message once
+            content = "📜 **Log (last 20)**\n*(empty)*"
+            msg = await th.send(content)
+            st.thread_summary_message_id = msg.id
+            return th
+        except Exception as e:
+            log.warning("Failed to create/find log thread: %r", e)
+            return None
+
+    async def update_log_summary(st: PanelState):
+        """Edit a single summary message in the log thread to show last 20."""
+        th = await ensure_log_thread(st)
+        if not th:
+            return
+        # build text newest first
+        last = st.logbook[-20:][::-1]
+        if last:
+            body = "\n".join(f"• <@{uid}> — <t:{ts}:t>" for uid, ts in last)
+            text = f"📜 **Log (last 20)**\n{body}"
+        else:
+            text = "📜 **Log (last 20)**\n*(empty)*"
+
+        # ensure we have (or create) the summary message we edit
+        msg = None
+        if st.thread_summary_message_id:
+            try:
+                msg = await th.fetch_message(st.thread_summary_message_id)
+            except Exception:
+                msg = None
+        if msg is None:
+            try:
+                msg = await th.send(text)
+                st.thread_summary_message_id = msg.id
+                return
+            except Exception:
+                return
+        try:
+            await msg.edit(content=text)
+        except Exception:
+            pass
+
+    # ----- state ops -----
     async def start_for(st: PanelState, user_id: int):
-        # Vrij starten: iedereen mag starten als het vrij is
         st.current_user_id = user_id
         st.current_started_ts = int(discord.utils.utcnow().timestamp())
-        # eventueel uit queue halen zodat geen duplicaten
         try:
             st.queue.remove(user_id)
         except ValueError:
             pass
 
     async def stop_only(st: PanelState):
-        # Reset zonder auto-start
         st.current_user_id = None
         st.current_started_ts = None
 
-    # ---------- Events ----------
+    # ----- events -----
     @bot.event
     async def on_ready():
         log.info("✅ Logged in as %s (id=%s)", getattr(bot.user, "name", "?"), getattr(bot.user, "id", "?"))
         if PANEL_CHANNEL_ID:
             ch = bot.get_channel(PANEL_CHANNEL_ID)
             if isinstance(ch, discord.TextChannel):
-                try:
-                    await ensure_panel(state_for(ch.id))
-                    log.info("Panel ensured in channel %s", PANEL_CHANNEL_ID)
-                except Exception as e:
-                    log.error("Ensure panel failed: %r", e)
+                st = state_for(ch.id)
+                await ensure_panel(st)
+                await ensure_log_thread(st)
+                await update_log_summary(st)
+                log.info("Panel ensured in channel %s", PANEL_CHANNEL_ID)
 
     @bot.event
     async def on_message(message: discord.Message):
-        # Panel onderaan houden: bij elk mens-bericht in panel-kanaal, repost panel
+        # keep panel at bottom
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
@@ -192,7 +258,7 @@ def make_bot() -> commands.Bot:
             async with st.lock:
                 await send_panel_bottom(st)
         except Exception as e:
-            log.warning("Failed to move panel to bottom: %r", e)
+            log.warning("Move panel failed: %r", e)
 
     @bot.event
     async def on_interaction(inter: Interaction):
@@ -215,15 +281,13 @@ def make_bot() -> commands.Bot:
         elif cid == "rsb_reset":
             await handle_reset(inter, st)
 
-    # ---------- Handlers ----------
+    # ----- handlers -----
     async def handle_search(inter: Interaction, st: PanelState):
         user = inter.user
         async with st.lock:
             if st.current_user_id is None:
-                # vrij starten
                 await start_for(st, user.id)
             else:
-                # al bezig → enkel in de lijst zetten als hij er nog niet in staat
                 if user.id != st.current_user_id and user.id not in st.queue:
                     st.queue.append(user.id)
             await edit_panel_from_interaction(inter, st)
@@ -232,14 +296,12 @@ def make_bot() -> commands.Bot:
         user = inter.user
         async with st.lock:
             if st.current_user_id and st.current_user_id == user.id:
-                # log found
                 ts = int(discord.utils.utcnow().timestamp())
                 st.logbook.append((user.id, ts))
                 if len(st.logbook) > 20:
                     st.logbook = st.logbook[-20:]
-                # stop zonder auto-start
                 await stop_only(st)
-            # anders: geen actie
+                await update_log_summary(st)  # <-- update thread
             await edit_panel_from_interaction(inter, st)
 
     async def handle_next(inter: Interaction, st: PanelState):
@@ -252,15 +314,16 @@ def make_bot() -> commands.Bot:
     async def handle_reset(inter: Interaction, st: PanelState):
         async with st.lock:
             if st.current_user_id:
-                # alleen huidige zoeker stoppen; niet automatisch door
-                await stop_only(st)
+                await stop_only(st)  # no auto-start
             await edit_panel_from_interaction(inter, st)
 
-    # ---------- Commands (stil) ----------
+    # ----- manual command -----
     @bot.command()
     async def panel(ctx: commands.Context):
         st = state_for(ctx.channel.id)
         await ensure_panel(st)
+        await ensure_log_thread(st)
+        await update_log_summary(st)
         try:
             await ctx.message.delete()
         except Exception:
