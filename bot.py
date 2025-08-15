@@ -1,4 +1,4 @@
-# bot.py
+# bot.py (Worker variant - minimal, with local-time stamp only)
 import os
 import asyncio
 import logging
@@ -67,12 +67,12 @@ def create_bot() -> commands.Bot:
     # ---------- Panel helpers ----------
     def panel_text(st: PanelState) -> str:
         lines: List[str] = []
-        # Searching line with local-aware timestamp + relative
+        # Searching line with local-aware time only (no relative)
         if st.current_user_id:
             if st.current_started_ts:
-                # <t:unix:t> = short time in viewer's locale, <t:unix:R> = relative
+                # <t:unix:t> = short time in viewer's locale
                 lines.append(
-                    f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t> (<t:{st.current_started_ts}:R>)"
+                    f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t>"
                 )
             else:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}>")
@@ -130,7 +130,6 @@ def create_bot() -> commands.Bot:
             except Exception:
                 pass
         except Exception:
-            # Fallback: keep panel alive
             try:
                 await inter.response.defer()
             except Exception:
@@ -174,10 +173,8 @@ def create_bot() -> commands.Bot:
         if not isinstance(message.channel, discord.TextChannel):
             return
         st = state_for(message.channel.id)
-        # Only act for the configured channel (or you can support multiple by calling !panel in others)
         if PANEL_CHANNEL_ID and message.channel.id != PANEL_CHANNEL_ID:
             return
-        # Repost panel at bottom (no extra text)
         try:
             async with st.lock:
                 await send_panel_bottom(st)
@@ -186,6 +183,7 @@ def create_bot() -> commands.Bot:
 
     @bot.event
     async def on_interaction(inter: Interaction):
+        # FIX: use 'inter', not 'interaction'
         if inter.type != discord.InteractionType.component:
             return
         cid = inter.data.get("custom_id")
@@ -213,11 +211,9 @@ def create_bot() -> commands.Bot:
                 # Already someone searching -> ensure user is in queue (no auto start)
                 if user.id != st.current_user_id and user.id not in st.queue:
                     st.queue.append(user.id)
-                await edit_panel_from_interaction(inter, st)
-                return
-
-            # No current searcher: start for the clicker (manual start)
-            await start_for(st, user.id)
+            else:
+                # Manual start
+                await start_for(st, user.id)
             await edit_panel_from_interaction(inter, st)
 
     async def handle_found(inter: Interaction, st: PanelState):
