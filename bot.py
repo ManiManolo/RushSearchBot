@@ -78,6 +78,9 @@ def create_bot() -> commands.Bot:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}>")
         else:
             lines.append("🟦 **Searching**: *nobody*")
+            
+            # ← lege regel tussen Searching en Queue
+    lines.append("")
 
         # Queue line: each user on its own line
         if st.queue:
