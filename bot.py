@@ -1,319 +1,76 @@
-# bot.py — RushSearchBot (Background Worker, minimal UI)
 import os
-import asyncio
-import logging
-import random
-from typing import Dict, List, Optional
-
 import discord
 from discord.ext import commands
-from discord import ui, ButtonStyle, Interaction
+from discord.ui import View, Button
+from datetime import datetime
+import pytz
 
-# ===== Logging =====
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("rushsearchbot")
-
-# ===== Environment =====
 TOKEN = os.getenv("DISCORD_TOKEN")
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing in environment variables.")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
-BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "300"))  # 5 min
-BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "900"))  # 15 min
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== Bot factory =====
-def create_bot() -> commands.Bot:
-    intents = discord.Intents.default()
-    intents.message_content = True
-    intents.guilds = True
-    intents.messages = True
-    bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+current_searcher = None
+queue = []
+logbook = []  # Lijst met tuples: (naam, tijd)
 
-    # ---------- Per-channel state ----------
-    class PanelState:
-        def __init__(self, channel_id: int):
-            self.channel_id: int = channel_id
-            self.panel_message_id: Optional[int] = None
-            self.current_user_id: Optional[int] = None
-            self.current_started_ts: Optional[int] = None  # UNIX epoch seconds
-            self.queue: List[int] = []
-            self.lock = asyncio.Lock()
+def format_panel():
+    searching_line = f"**Searching:** {current_searcher[0]} ({current_searcher[1].strftime('%H:%M')})" if current_searcher else "**Searching:** -"
+    queue_line = "\n".join(queue) if queue else "-"
+    log_lines = "\n".join([f"{name} ({time.strftime('%H:%M')})" for name, time in logbook[-20:]]) if logbook else "-"
+    return f"{searching_line}\n\n**Queue:**\n{queue_line}\n\n**Logbook:**\n||{log_lines}||"
 
-        def channel(self) -> Optional[discord.TextChannel]:
-            return bot.get_channel(self.channel_id)
+class PanelView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(Button(label="🔎 Search", style=discord.ButtonStyle.primary, custom_id="search"))
+        self.add_item(Button(label="🎮 Found", style=discord.ButtonStyle.success, custom_id="found"))
+        self.add_item(Button(label="🔁 Reset", style=discord.ButtonStyle.danger, custom_id="reset"))
+        self.add_item(Button(label="⏭ Next", style=discord.ButtonStyle.secondary, custom_id="next"))
 
-    PANELS: Dict[int, PanelState] = {}
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        await ensure_panel(channel)
 
-    def state_for(channel_id: int) -> PanelState:
-        if channel_id not in PANELS:
-            PANELS[channel_id] = PanelState(channel_id)
-        return PANELS[channel_id]
-
-    # ---------- UI ----------
-    class SearchView(ui.View):
-        def __init__(self, channel_id: int):
-            super().__init__(timeout=None)  # persistent
-            self.channel_id = channel_id
-            self.add_item(ui.Button(label="🔵 Search", style=ButtonStyle.primary,  custom_id="rsb_search"))
-            self.add_item(ui.Button(label="✅ Found",  style=ButtonStyle.success,  custom_id="rsb_found"))
-            self.add_item(ui.Button(label="🟡 Next",   style=ButtonStyle.secondary, custom_id="rsb_next"))
-            self.add_item(ui.Button(label="🔁 Reset",  style=ButtonStyle.danger,    custom_id="rsb_reset"))
-
-        async def interaction_check(self, interaction: Interaction) -> bool:
-            return interaction.channel and interaction.channel.id == self.channel_id
-
-    # ---------- Panel helpers ----------
-    def panel_text(st: PanelState) -> str:
-        lines: List[str] = []
-
-        # Searching (lokale tijd, geen relative)
-        if st.current_user_id:
-            if st.current_started_ts:
-                # <t:unix:t> = korte tijd in locale van de kijker
-                lines.append(
-                    f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t>"
-                )
-            else:
-                lines.append(f"🔎 **Searching**: <@{st.current_user_id}>")
-        else:
-            lines.append("🟦 **Searching**: *nobody*")
-
-        # Lege regel tussen Searching en Queue
-        lines.append("")
-
-        # Queue (ieder op nieuwe regel)
-        if st.queue:
-            queue_lines = "\n".join(f"• <@{uid}>" for uid in st.queue)
-            lines.append(f"🟡 **Queue**:\n{queue_lines}")
-        else:
-            lines.append("🟡 **Queue**:\n*empty*")
-
-        return "\n".join(lines)
-
-    async def send_panel_bottom(st: PanelState):
-        """(Re)post panel als laatste bericht; verwijder oude."""
-        ch = st.channel()
-        if not ch:
-            raise RuntimeError(f"Channel {st.channel_id} not found or access denied.")
-        if st.panel_message_id:
-            try:
-                old = await ch.fetch_message(st.panel_message_id)
-                await old.delete()
-            except Exception:
-                pass
-        msg = await ch.send(panel_text(st), view=SearchView(st.channel_id))
-        st.panel_message_id = msg.id
-        return msg
-
-    async def ensure_panel(st: PanelState):
-        """Bestaat er al een panel? Edit. Zo niet, post beneden."""
-        ch = st.channel()
-        if not ch:
+async def ensure_panel(channel):
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user:
+            await msg.edit(content=format_panel(), view=PanelView())
             return
-        if st.panel_message_id:
-            try:
-                msg = await ch.fetch_message(st.panel_message_id)
-                await msg.edit(content=panel_text(st), view=SearchView(st.channel_id))
-                return
-            except Exception:
-                pass
-        await send_panel_bottom(st)
+    await channel.send(content=format_panel(), view=PanelView())
 
-    async def edit_panel_from_interaction(inter: Interaction, st: PanelState):
-        """Snel updaten op dezelfde message; valt terug op repost indien nodig."""
-        try:
-            await inter.response.edit_message(content=panel_text(st), view=SearchView(st.channel_id))
-        except discord.NotFound:
-            await send_panel_bottom(st)
-            try:
-                await inter.response.defer()
-            except Exception:
-                pass
-        except Exception:
-            try:
-                await inter.response.defer()
-            except Exception:
-                pass
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    global current_searcher, queue, logbook
 
-    # ---------- State transitions ----------
-    async def start_for(st: PanelState, user_id: int):
-        st.current_user_id = user_id
-        st.current_started_ts = int(discord.utils.utcnow().timestamp())
-        try:
-            st.queue.remove(user_id)  # voorkom duplicaten
-        except ValueError:
-            pass
+    if interaction.type != discord.InteractionType.component:
+        return
 
-    async def handover_to_next(st: PanelState):
-        st.current_user_id = None
-        st.current_started_ts = None
-        if st.queue:
-            nxt = st.queue.pop(0)
-            await start_for(st, nxt)
+    user_name = interaction.user.display_name
 
-    # ---------- Events ----------
-    @bot.event
-    async def on_ready():
-        log.info("✅ Logged in as %s (id=%s)", getattr(bot.user, "name", "?"), getattr(bot.user, "id", "?"))
-        if PANEL_CHANNEL_ID:
-            ch = bot.get_channel(PANEL_CHANNEL_ID)
-            if isinstance(ch, discord.TextChannel):
-                try:
-                    await ensure_panel(state_for(ch.id))
-                    log.info("Panel ensured in channel %s", PANEL_CHANNEL_ID)
-                except Exception as e:
-                    log.error("Ensure panel failed: %r", e)
+    if interaction.data["custom_id"] == "search":
+        if current_searcher is None:
+            current_searcher = (user_name, datetime.now())
+        elif user_name not in queue:
+            queue.append(user_name)
 
-    @bot.event
-    async def on_message(message: discord.Message):
-        # Panel altijd onderaan: bij elk mens-bericht in het panel-kanaal reposten we het panel.
-        if message.author.bot:
-            return
-        if not isinstance(message.channel, discord.TextChannel):
-            return
-        if PANEL_CHANNEL_ID and message.channel.id != PANEL_CHANNEL_ID:
-            return
-        st = state_for(message.channel.id)
-        try:
-            async with st.lock:
-                await send_panel_bottom(st)
-        except Exception as e:
-            log.warning("Failed to move panel to bottom: %r", e)
+    elif interaction.data["custom_id"] == "found":
+        if current_searcher and current_searcher[0] == user_name:
+            logbook.append((user_name, datetime.now()))
+            current_searcher = None
 
-    @bot.event
-    async def on_interaction(inter: Interaction):
-        # Belangrijk: gebruik 'inter', niet 'interaction'
-        if inter.type != discord.InteractionType.component:
-            return
-        cid = inter.data.get("custom_id")
-        if cid not in {"rsb_search", "rsb_found", "rsb_next", "rsb_reset"}:
-            return
-        ch = inter.channel
-        if not isinstance(ch, discord.TextChannel):
-            return
-        st = state_for(ch.id)
+    elif interaction.data["custom_id"] == "reset":
+        if current_searcher:
+            current_searcher = None
 
-        if cid == "rsb_search":
-            await handle_search(inter, st)
-        elif cid == "rsb_found":
-            await handle_found(inter, st)
-        elif cid == "rsb_next":
-            await handle_next(inter, st)
-        elif cid == "rsb_reset":
-            await handle_reset(inter, st)
+    elif interaction.data["custom_id"] == "next":
+        if not current_searcher and queue:
+            current_searcher = (queue.pop(0), datetime.now())
 
-    # ---------- Button handlers ----------
-    async def handle_search(inter: Interaction, st: PanelState):
-        user = inter.user
-        async with st.lock:
-            if st.current_user_id:
-                # Iemand is bezig -> alleen in de wachtrij zetten (niet auto-starten)
-                if user.id != st.current_user_id and user.id not in st.queue:
-                    st.queue.append(user.id)
-            else:
-                # Handmatig starten
-                await start_for(st, user.id)
-            await edit_panel_from_interaction(inter, st)
+    await interaction.response.edit_message(content=format_panel(), view=PanelView())
 
-    async def handle_found(inter: Interaction, st: PanelState):
-        user = inter.user
-        if st.current_user_id and st.current_user_id == user.id:
-            async with st.lock:
-                await handover_to_next(st)
-                await edit_panel_from_interaction(inter, st)
-        else:
-            try:
-                await inter.response.defer()
-            except Exception:
-                pass
-
-    async def handle_next(inter: Interaction, st: PanelState):
-        user = inter.user
-        async with st.lock:
-            if user.id not in st.queue and user.id != st.current_user_id:
-                st.queue.append(user.id)
-            await edit_panel_from_interaction(inter, st)
-
-    async def handle_reset(inter: Interaction, st: PanelState):
-        # Iedereen mag resetten; reset alleen de huidige zoeker en ga door naar de volgende (als die er is).
-        async with st.lock:
-            if st.current_user_id:
-                await handover_to_next(st)
-            await edit_panel_from_interaction(inter, st)
-
-    # ---------- Commands (stil) ----------
-    @bot.command()
-    async def panel(ctx: commands.Context):
-        st = state_for(ctx.channel.id)
-        await ensure_panel(st)
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-
-    @bot.command()
-    @commands.has_permissions(manage_messages=True)
-    async def resetqueue(ctx: commands.Context):
-        st = state_for(ctx.channel.id)
-        st.queue.clear()
-        st.current_user_id = None
-        st.current_started_ts = None
-        await ensure_panel(st)
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-
-    return bot
-
-# ===== Robust startup with backoff (tegen 429/Cloudflare) =====
-async def run_with_backoff(token: str):
-    attempt = 0
-    while True:
-        bot = create_bot()
-        try:
-            log.info("🔐 Starting Discord login...")
-            await bot.start(token)
-            break
-        except discord.HTTPException as e:
-            status = getattr(e, "status", None)
-            retry_after = None
-            try:
-                if hasattr(e, "response") and e.response is not None:
-                    ra = e.response.headers.get("Retry-After")
-                    if ra is not None:
-                        retry_after = float(ra)
-            except Exception:
-                pass
-            if status == 429 or retry_after is not None:
-                cap = min(BACKOFF_MAX, max(BACKOFF_MIN, 5 * (2 ** attempt)))
-                delay = (retry_after + random.uniform(0, 10)) if retry_after is not None else random.uniform(BACKOFF_MIN, cap)
-                attempt += 1
-                log.warning("⚠️ 429 rate limited. Sleeping for %.1f s (Retry-After=%s).", delay, retry_after)
-                await asyncio.sleep(delay)
-            else:
-                log.error("HTTPException during start (status=%s): %r", status, e)
-                await asyncio.sleep(30)
-        except Exception as e:
-            log.error("Unexpected error during start: %r", e)
-            await asyncio.sleep(30)
-        finally:
-            try:
-                await bot.close()
-            except Exception:
-                pass
-            try:
-                if hasattr(bot, "http") and getattr(bot.http, "session", None):
-                    await bot.http.close()
-            except Exception:
-                pass
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(run_with_backoff(TOKEN))
-    except KeyboardInterrupt:
-        log.info("🛑 Shutting down...")
+bot.run(TOKEN)
