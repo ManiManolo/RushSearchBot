@@ -1,22 +1,20 @@
 services:
-  - type: web
-    name: rushsearchbot
+  - type: worker
+    name: rushsearchbot-worker
     env: python
-    plan: free
+    plan: free         # of standard als je betaalde uptime wilt
+    region: frankfurt  # kies jouw regio als string; laat weg als je via UI kiest
+    autoDeploy: false
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot.py"
     envVars:
       - key: DISCORD_TOKEN
-        sync: false # Zet dit later handmatig in de Render UI, nooit in de repo!
+        sync: false        # waarde zet je in de Render UI (secrets)
       - key: PANEL_CHANNEL_ID
         value: "1404949428040896613"
+      - key: LOG_LEVEL
+        value: "INFO"
       - key: BACKOFF_MIN
         value: "300"
       - key: BACKOFF_MAX
         value: "900"
-      - key: PORT
-        value: "8080"
-      - key: KEEPALIVE_URL
-        value: "http://127.0.0.1:8080/"
-      - key: LOG_LEVEL
-        value: "INFO"
