@@ -1,8 +1,9 @@
-# bot.py — RushSearchBot: panel + separate thread log (last 20)
+# bot.py — RushSearchBot: minimal panel + thread "Log" (last 50)
 import os
 import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -21,6 +22,11 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing")
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
 
+# ---------- constants ----------
+LOG_THREAD_NAME = "Log"
+LOG_LIMIT = 50
+TZ = ZoneInfo("Europe/Amsterdam")  # voor logtijd HH:MM
+
 # ---------- bot ----------
 def make_bot() -> commands.Bot:
     intents = discord.Intents.default()
@@ -33,15 +39,17 @@ def make_bot() -> commands.Bot:
     class PanelState:
         def __init__(self, channel_id: int):
             self.channel_id: int = channel_id
+
+            # panel
             self.panel_message_id: Optional[int] = None
             self.current_user_id: Optional[int] = None
             self.current_started_ts: Optional[int] = None  # unix seconds
             self.queue: List[int] = []
-            self.logbook: List[Tuple[int, int]] = []  # (user_id, ts) last 20
 
-            # log thread data
+            # log (thread + summary message)
             self.thread_id: Optional[int] = None
             self.thread_summary_message_id: Optional[int] = None
+            self.logbook: List[Tuple[int, int]] = []  # (user_id, ts)
 
             self.lock = asyncio.Lock()
 
@@ -75,29 +83,30 @@ def make_bot() -> commands.Bot:
         # Searching
         if st.current_user_id:
             if st.current_started_ts:
-                lines.append(f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t>")
+                # alleen tijd (lokaal voor elke gebruiker via Discord-render)
+                lines.append(f"🔎 **Searching**: <@{st.current_user_id}> — <t:{st.current_started_ts}:t>")
             else:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}>")
         else:
             lines.append("🟦 **Searching**: *nobody*")
 
-        # empty line between sections
+        # lege regel tussen delen
         lines.append("")
 
-        # Queue (each on new line)
+        # Queue (elke gebruiker op nieuwe regel)
         if st.queue:
             queue_lines = "\n".join(f"• <@{uid}>" for uid in st.queue)
             lines.append(f"🟡 **Queue**:\n{queue_lines}")
         else:
             lines.append("🟡 **Queue**:\n*empty*")
 
-        # no log here anymore (moved to thread)
         return "\n".join(lines)
 
     async def send_panel_bottom(st: PanelState):
         ch = st.channel()
         if not ch:
             raise RuntimeError(f"Channel {st.channel_id} not found")
+        # verwijder vorige panel als die er is
         if st.panel_message_id:
             try:
                 old = await ch.fetch_message(st.panel_message_id)
@@ -106,7 +115,6 @@ def make_bot() -> commands.Bot:
                 pass
         msg = await ch.send(panel_text(st), view=SearchView(st.channel_id))
         st.panel_message_id = msg.id
-        # make sure log thread exists
         await ensure_log_thread(st)
         return msg
 
@@ -125,6 +133,7 @@ def make_bot() -> commands.Bot:
         await send_panel_bottom(st)
 
     async def edit_panel_from_interaction(inter: Interaction, st: PanelState):
+        # Probeer het paneel te editen; zo niet, plaats ‘m onderaan opnieuw.
         try:
             await inter.response.edit_message(content=panel_text(st), view=SearchView(st.channel_id))
         except discord.NotFound:
@@ -140,15 +149,13 @@ def make_bot() -> commands.Bot:
                 pass
 
     # ----- log thread helpers -----
-    LOG_THREAD_NAME = "rushsearch-log"
-
     async def ensure_log_thread(st: PanelState) -> Optional[discord.Thread]:
-        """Find or create the log thread in the panel channel; cache IDs."""
+        """Zoek of maak de thread 'Log' en zorg voor een (één) samenvattingsbericht."""
         ch = st.channel()
         if not ch:
             return None
 
-        # 1) if we have an id, try fetch
+        # 1) Hebben we al een thread-id?
         if st.thread_id:
             th = bot.get_channel(st.thread_id)
             if isinstance(th, discord.Thread):
@@ -157,49 +164,69 @@ def make_bot() -> commands.Bot:
                         await th.edit(archived=False, locked=False)
                     except Exception:
                         pass
+                # check of het summary-bericht er nog is
+                if st.thread_summary_message_id:
+                    try:
+                        await th.fetch_message(st.thread_summary_message_id)
+                    except Exception:
+                        st.thread_summary_message_id = None
+                if st.thread_summary_message_id is None:
+                    # aanmaken als missend
+                    msg = await th.send("📜 **Log**\n*(empty)*")
+                    st.thread_summary_message_id = msg.id
                 return th
-            # else fall through and try find/create
 
-        # 2) try to find an active thread with the right name
+        # 2) Probeer een bestaande actieve thread met de juiste naam te vinden
         try:
-            for th in ch.threads:  # active threads
+            for th in ch.threads:
                 if isinstance(th, discord.Thread) and th.name == LOG_THREAD_NAME:
                     st.thread_id = th.id
+                    # summary check/aanmaak
+                    if st.thread_summary_message_id is None:
+                        msg = await th.send("📜 **Log**\n*(empty)*")
+                        st.thread_summary_message_id = msg.id
                     return th
         except Exception:
             pass
 
-        # 3) create a public thread not tied to a starter message
+        # 3) Maak een nieuwe public thread
         try:
             th = await ch.create_thread(
                 name=LOG_THREAD_NAME,
                 type=discord.ChannelType.public_thread,
-                auto_archive_duration=4320  # 3 days, re-open when we post
+                auto_archive_duration=4320  # 3 dagen
             )
             st.thread_id = th.id
-            # create the summary message once
-            content = "📜 **Log (last 50)**\n*(empty)*"
-            msg = await th.send(content)
+            msg = await th.send("📜 **Log**\n*(empty)*")
             st.thread_summary_message_id = msg.id
             return th
         except Exception as e:
             log.warning("Failed to create/find log thread: %r", e)
             return None
 
+    def fmt_hm(ts_unix: int) -> str:
+        # Format HH:MM in Europe/Amsterdam (zonder extra packages)
+        dt = discord.utils.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+        # Beter: gebruik ts_unix zelf
+        dt = discord.utils.datetime.datetime.fromtimestamp(ts_unix, TZ)
+        return dt.strftime("%H:%M")
+
     async def update_log_summary(st: PanelState):
-        """Edit a single summary message in the log thread to show last 50."""
+        """Edit één samenvattingsbericht in de 'Log' thread met laatste 50."""
         th = await ensure_log_thread(st)
         if not th:
             return
-        # build text newest first
-        last = st.logbook[-50:][::-1]
-        if last:
-            body = "\n".join(f"• <@{uid}> — <t:{ts}:t>" for uid, ts in last)
-            text = f"📜 **Log (last 20)**\n{body}"
-        else:
-            text = "📜 **Log (last 20)**\n*(empty)*"
 
-        # ensure we have (or create) the summary message we edit
+        last = st.logbook[-LOG_LIMIT:][::-1]  # nieuwste bovenaan
+        if last:
+            # compact: 2 kolommen in codeblok (mention links, tijd rechts)
+            rows = [f"{('<@'+str(uid)+'>'):<22} {fmt_hm(ts)}" for uid, ts in last]
+            body = "\n".join(rows)
+            text = f"📜 **Log**\n```{body}```"
+        else:
+            text = "📜 **Log**\n*(empty)*"
+
+        # haal (of maak) het summary-bericht
         msg = None
         if st.thread_summary_message_id:
             try:
@@ -246,7 +273,7 @@ def make_bot() -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message):
-        # keep panel at bottom
+        # zorg dat het paneel onderaan blijft
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
@@ -261,25 +288,26 @@ def make_bot() -> commands.Bot:
             log.warning("Move panel failed: %r", e)
 
     @bot.event
-    async def on_interaction(inter: Interaction):
-        if inter.type != discord.InteractionType.component:
+    async def on_interaction(interaction: Interaction):
+        # knoppen afhandelen
+        if interaction.type != discord.InteractionType.component:
             return
-        cid = inter.data.get("custom_id")
+        cid = interaction.data.get("custom_id")
         if cid not in {"rsb_search", "rsb_found", "rsb_next", "rsb_reset"}:
             return
-        ch = inter.channel
+        ch = interaction.channel
         if not isinstance(ch, discord.TextChannel):
             return
         st = state_for(ch.id)
 
         if cid == "rsb_search":
-            await handle_search(inter, st)
+            await handle_search(interaction, st)
         elif cid == "rsb_found":
-            await handle_found(inter, st)
+            await handle_found(interaction, st)
         elif cid == "rsb_next":
-            await handle_next(inter, st)
+            await handle_next(interaction, st)
         elif cid == "rsb_reset":
-            await handle_reset(inter, st)
+            await handle_reset(interaction, st)
 
     # ----- handlers -----
     async def handle_search(inter: Interaction, st: PanelState):
@@ -298,10 +326,10 @@ def make_bot() -> commands.Bot:
             if st.current_user_id and st.current_user_id == user.id:
                 ts = int(discord.utils.utcnow().timestamp())
                 st.logbook.append((user.id, ts))
-                if len(st.logbook) > 50:
-                    st.logbook = st.logbook[-50:]
+                if len(st.logbook) > LOG_LIMIT:
+                    st.logbook = st.logbook[-LOG_LIMIT:]
                 await stop_only(st)
-                await update_log_summary(st)  # <-- update thread
+                await update_log_summary(st)  # update thread
             await edit_panel_from_interaction(inter, st)
 
     async def handle_next(inter: Interaction, st: PanelState):
@@ -314,10 +342,10 @@ def make_bot() -> commands.Bot:
     async def handle_reset(inter: Interaction, st: PanelState):
         async with st.lock:
             if st.current_user_id:
-                await stop_only(st)  # no auto-start
+                await stop_only(st)  # geen auto-start
             await edit_panel_from_interaction(inter, st)
 
-    # ----- manual command -----
+    # ----- command -----
     @bot.command()
     async def panel(ctx: commands.Context):
         st = state_for(ctx.channel.id)
