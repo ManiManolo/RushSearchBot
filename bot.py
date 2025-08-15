@@ -1,4 +1,4 @@
-# bot.py (Worker variant - minimal, with local-time stamp only)
+# bot.py — RushSearchBot (Background Worker, minimal UI)
 import os
 import asyncio
 import logging
@@ -16,14 +16,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("rushsearchbot")
 
+# ===== Environment =====
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing in environment variables.")
 
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
-BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "300"))
-BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "900"))
+BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "300"))  # 5 min
+BACKOFF_MAX = int(os.getenv("BACKOFF_MAX", "900"))  # 15 min
 
+# ===== Bot factory =====
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.message_content = True
@@ -67,10 +69,11 @@ def create_bot() -> commands.Bot:
     # ---------- Panel helpers ----------
     def panel_text(st: PanelState) -> str:
         lines: List[str] = []
-        # Searching line with local-aware time only (no relative)
+
+        # Searching (lokale tijd, geen relative)
         if st.current_user_id:
             if st.current_started_ts:
-                # <t:unix:t> = short time in viewer's locale
+                # <t:unix:t> = korte tijd in locale van de kijker
                 lines.append(
                     f"🔎 **Searching**: <@{st.current_user_id}> — since <t:{st.current_started_ts}:t>"
                 )
@@ -78,11 +81,11 @@ def create_bot() -> commands.Bot:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}>")
         else:
             lines.append("🟦 **Searching**: *nobody*")
-            
-            # ← lege regel tussen Searching en Queue
-    lines.append("")
 
-        # Queue line: each user on its own line
+        # Lege regel tussen Searching en Queue
+        lines.append("")
+
+        # Queue (ieder op nieuwe regel)
         if st.queue:
             queue_lines = "\n".join(f"• <@{uid}>" for uid in st.queue)
             lines.append(f"🟡 **Queue**:\n{queue_lines}")
@@ -92,11 +95,10 @@ def create_bot() -> commands.Bot:
         return "\n".join(lines)
 
     async def send_panel_bottom(st: PanelState):
-        """Always (re)send the panel as a new message at the bottom, removing the old one."""
+        """(Re)post panel als laatste bericht; verwijder oude."""
         ch = st.channel()
         if not ch:
             raise RuntimeError(f"Channel {st.channel_id} not found or access denied.")
-        # Try delete old panel (ignore errors)
         if st.panel_message_id:
             try:
                 old = await ch.fetch_message(st.panel_message_id)
@@ -108,7 +110,7 @@ def create_bot() -> commands.Bot:
         return msg
 
     async def ensure_panel(st: PanelState):
-        """If there is a panel message, edit it; otherwise send new at bottom."""
+        """Bestaat er al een panel? Edit. Zo niet, post beneden."""
         ch = st.channel()
         if not ch:
             return
@@ -122,11 +124,10 @@ def create_bot() -> commands.Bot:
         await send_panel_bottom(st)
 
     async def edit_panel_from_interaction(inter: Interaction, st: PanelState):
-        """Fast/noiseless update when the interaction is on the panel itself."""
+        """Snel updaten op dezelfde message; valt terug op repost indien nodig."""
         try:
             await inter.response.edit_message(content=panel_text(st), view=SearchView(st.channel_id))
         except discord.NotFound:
-            # If the panel message vanished, (re)send at bottom
             await send_panel_bottom(st)
             try:
                 await inter.response.defer()
@@ -142,9 +143,8 @@ def create_bot() -> commands.Bot:
     async def start_for(st: PanelState, user_id: int):
         st.current_user_id = user_id
         st.current_started_ts = int(discord.utils.utcnow().timestamp())
-        # remove from queue if present, to avoid duplicates
         try:
-            st.queue.remove(user_id)
+            st.queue.remove(user_id)  # voorkom duplicaten
         except ValueError:
             pass
 
@@ -170,14 +170,14 @@ def create_bot() -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message):
-        # Keep panel at the bottom: if anyone posts in the panel channel, re-post panel under it.
+        # Panel altijd onderaan: bij elk mens-bericht in het panel-kanaal reposten we het panel.
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
             return
-        st = state_for(message.channel.id)
         if PANEL_CHANNEL_ID and message.channel.id != PANEL_CHANNEL_ID:
             return
+        st = state_for(message.channel.id)
         try:
             async with st.lock:
                 await send_panel_bottom(st)
@@ -186,7 +186,7 @@ def create_bot() -> commands.Bot:
 
     @bot.event
     async def on_interaction(inter: Interaction):
-        # FIX: use 'inter', not 'interaction'
+        # Belangrijk: gebruik 'inter', niet 'interaction'
         if inter.type != discord.InteractionType.component:
             return
         cid = inter.data.get("custom_id")
@@ -206,22 +206,21 @@ def create_bot() -> commands.Bot:
         elif cid == "rsb_reset":
             await handle_reset(inter, st)
 
-    # ---------- Button handlers (minimal: update panel only) ----------
+    # ---------- Button handlers ----------
     async def handle_search(inter: Interaction, st: PanelState):
         user = inter.user
         async with st.lock:
             if st.current_user_id:
-                # Already someone searching -> ensure user is in queue (no auto start)
+                # Iemand is bezig -> alleen in de wachtrij zetten (niet auto-starten)
                 if user.id != st.current_user_id and user.id not in st.queue:
                     st.queue.append(user.id)
             else:
-                # Manual start
+                # Handmatig starten
                 await start_for(st, user.id)
             await edit_panel_from_interaction(inter, st)
 
     async def handle_found(inter: Interaction, st: PanelState):
         user = inter.user
-        # Only current searcher can mark found; then switch to next immediately
         if st.current_user_id and st.current_user_id == user.id:
             async with st.lock:
                 await handover_to_next(st)
@@ -235,19 +234,18 @@ def create_bot() -> commands.Bot:
     async def handle_next(inter: Interaction, st: PanelState):
         user = inter.user
         async with st.lock:
-            # Never auto-start from Next; just queue the user
             if user.id not in st.queue and user.id != st.current_user_id:
                 st.queue.append(user.id)
             await edit_panel_from_interaction(inter, st)
 
     async def handle_reset(inter: Interaction, st: PanelState):
-        # Anyone can reset ONLY the current searcher; then move to next (if any)
+        # Iedereen mag resetten; reset alleen de huidige zoeker en ga door naar de volgende (als die er is).
         async with st.lock:
             if st.current_user_id:
                 await handover_to_next(st)
             await edit_panel_from_interaction(inter, st)
 
-    # ---------- Commands (silent) ----------
+    # ---------- Commands (stil) ----------
     @bot.command()
     async def panel(ctx: commands.Context):
         st = state_for(ctx.channel.id)
@@ -272,7 +270,7 @@ def create_bot() -> commands.Bot:
 
     return bot
 
-# --------- Robust startup with backoff ----------
+# ===== Robust startup with backoff (tegen 429/Cloudflare) =====
 async def run_with_backoff(token: str):
     attempt = 0
     while True:
