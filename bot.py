@@ -1,4 +1,4 @@
-# bot.py — RushSearchBot: single panel + "log" thread reuse, no pings, clearpanel & panel commands
+# bot.py — RushSearchBot: single panel, strong clearpanel, no pings, log thread reuse
 
 import os
 import asyncio
@@ -99,11 +99,23 @@ def make_bot() -> commands.Bot:
             lines.append("🟡 **Queue**:\n*empty*")
         return "\n".join(lines)
 
+    async def delete_old_panels(ch: discord.TextChannel, limit: int = 200) -> None:
+        """Verwijder recente bot-berichten (oude panels) in het paneelkanaal."""
+        try:
+            async for m in ch.history(limit=limit, oldest_first=False):
+                if m.author == bot.user:
+                    try:
+                        await m.delete()
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("Purge bot messages failed: %r", e)
+
     async def send_panel_bottom() -> discord.Message:
         ch = ST.panel_channel()
         if not ch:
             raise RuntimeError(f"Panel channel {ST.panel_channel_id} not found")
-        # verwijder vorige panel
+        # verwijder specifiek het laatst bekende panel-bericht
         if ST.panel_message_id:
             try:
                 old = await ch.fetch_message(ST.panel_message_id)
@@ -114,25 +126,35 @@ def make_bot() -> commands.Bot:
         ST.panel_message_id = msg.id
         return msg
 
-    async def ensure_single_panel() -> None:
-        """Zorg dat er maar één paneel is: verwijder recente botberichten, post paneel opnieuw."""
+    async def render_panel_in_place() -> None:
+        """Probeer het huidige panel te overschrijven; val terug op ‘ensure_single_panel’."""
         ch = ST.panel_channel()
         if not ch:
             return
-        try:
-            async for m in ch.history(limit=50):
-                if m.author == bot.user:
-                    try:
-                        await m.delete()
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.warning("Purge bot messages failed: %r", e)
+        if ST.panel_message_id:
+            try:
+                msg = await ch.fetch_message(ST.panel_message_id)
+                await msg.edit(content=panel_text(), view=SearchView(ST.panel_channel_id), allowed_mentions=NO_PINGS)
+                return
+            except Exception:
+                pass
+        await ensure_single_panel()
+
+    async def ensure_single_panel() -> None:
+        """Zorg dat er maar één paneel staat: wis bot-berichten en post opnieuw."""
+        ch = ST.panel_channel()
+        if not ch:
+            return
+        await delete_old_panels(ch, limit=200)
         await send_panel_bottom()
 
     async def edit_panel_from_inter(inter: Interaction) -> None:
         try:
-            await inter.response.edit_message(content=panel_text(), view=SearchView(ST.panel_channel_id), allowed_mentions=NO_PINGS)
+            await inter.response.edit_message(
+                content=panel_text(),
+                view=SearchView(ST.panel_channel_id),
+                allowed_mentions=NO_PINGS,
+            )
         except discord.NotFound:
             await send_panel_bottom()
             try:
@@ -195,7 +217,11 @@ def make_bot() -> commands.Bot:
         try:
             th = await base.create_thread(name="log", auto_archive_duration=10080)
         except discord.HTTPException:
-            th = await ch.create_thread(name="log", auto_archive_duration=10080, type=discord.ChannelType.public_thread)
+            th = await ch.create_thread(
+                name="log",
+                auto_archive_duration=10080,
+                type=discord.ChannelType.public_thread,
+            )
 
         ST.log_thread_id = th.id
 
@@ -245,6 +271,7 @@ def make_bot() -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message):
+        # Houd paneel onderaan in het paneelkanaal
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
@@ -320,30 +347,43 @@ def make_bot() -> commands.Bot:
     # ==================== commands ====================
     @bot.command()
     async def panel(ctx: commands.Context):
-        """Maak paneel opnieuw (state blijft behouden)."""
-        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
-            return
+        """Maak paneel opnieuw (state blijft behouden). Mag in elk kanaal."""
         async with ST.lock:
             await ensure_single_panel()
             await get_or_create_log_thread()
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
+        # verwijder het commando als het in het paneelkanaal staat
+        if isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == PANEL_CHANNEL_ID:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
 
     @bot.command()
     async def clearpanel(ctx: commands.Context):
-        """Leeg state en maak een nieuw panel (zonder zoekers en queue)."""
-        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
+        """
+        Leeg de state (niemand + lege queue) en forceer exact één nieuw paneel.
+        Mag in elk kanaal worden gebruikt.
+        """
+        ch = ST.panel_channel()
+        if ch is None:
             return
         async with ST.lock:
+            # 1) state leeg
             ST.clear()
-            await ensure_single_panel()   # nieuw paneel, lege state
-            await get_or_create_log_thread()  # log-thread laten staan/hergebruiken
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
+            # 2) probeer het huidige panel-bericht te overschrijven (instant feedback)
+            await render_panel_in_place()
+            # 3) extra zeker: wis álle bot-berichten en plaats precies één nieuw paneel
+            await delete_old_panels(ch, limit=200)
+            await send_panel_bottom()
+            # 4) log thread garanderen (geen nieuwe aanmaken als al bestaat)
+            await get_or_create_log_thread()
+
+        # verwijder het commando als het in het paneelkanaal staat
+        if isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == PANEL_CHANNEL_ID:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
 
     return bot
 
