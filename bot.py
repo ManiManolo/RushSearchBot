@@ -1,4 +1,4 @@
-# bot.py — RushSearchBot: single panel, strong clearpanel, no pings, log thread reuse
+# bot.py — RushSearchBot: single panel, log thread, no pings, + !clear @user
 
 import os
 import asyncio
@@ -35,7 +35,7 @@ def make_bot() -> commands.Bot:
     intents.messages = True
     intents.message_content = True
 
-    bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+    bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, allowed_mentions=NO_PINGS)
 
     # ---------- state ----------
     class PanelState:
@@ -115,7 +115,6 @@ def make_bot() -> commands.Bot:
         ch = ST.panel_channel()
         if not ch:
             raise RuntimeError(f"Panel channel {ST.panel_channel_id} not found")
-        # verwijder specifiek het laatst bekende panel-bericht
         if ST.panel_message_id:
             try:
                 old = await ch.fetch_message(ST.panel_message_id)
@@ -127,7 +126,7 @@ def make_bot() -> commands.Bot:
         return msg
 
     async def render_panel_in_place() -> None:
-        """Probeer het huidige panel te overschrijven; val terug op ‘ensure_single_panel’."""
+        """Probeer het huidige panel te overschrijven; val terug op ensure_single_panel()."""
         ch = ST.panel_channel()
         if not ch:
             return
@@ -345,40 +344,76 @@ def make_bot() -> commands.Bot:
             await edit_panel_from_inter(inter)
 
     # ==================== commands ====================
-    @bot.command()
-    async def panel(ctx: commands.Context):
+    @bot.command(name="panel")
+    async def panel_cmd(ctx: commands.Context):
         """Maak paneel opnieuw (state blijft behouden). Mag in elk kanaal."""
         async with ST.lock:
             await ensure_single_panel()
             await get_or_create_log_thread()
-        # verwijder het commando als het in het paneelkanaal staat
         if isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == PANEL_CHANNEL_ID:
             try:
                 await ctx.message.delete()
             except Exception:
                 pass
 
-    @bot.command()
-    async def clearpanel(ctx: commands.Context):
+    @bot.command(name="clear")
+    async def clear_cmd(ctx: commands.Context, member: discord.Member):
         """
-        Leeg de state (niemand + lege queue) en forceer exact één nieuw paneel.
-        Mag in elk kanaal worden gebruikt.
+        Haal precies deze gebruiker uit het paneel:
+        - als hij/zij aan het zoeken is -> stoppen
+        - als hij/zij in de queue staat -> verwijderen
+        Logt wie dit deed, met tijdstempel.
+        """
+        actor = ctx.author
+        target_id = member.id
+        did_anything = False
+
+        async with ST.lock:
+            # als current -> stop
+            if ST.current_user_id == target_id:
+                await stop_only()
+                did_anything = True
+                ts = int(discord.utils.utcnow().timestamp())
+                await append_log_line(f"• {member.mention} ❌ by {actor.mention} <t:{ts}:t>")
+
+            # als in queue -> remove
+            if target_id in ST.queue:
+                ST.queue = [uid for uid in ST.queue if uid != target_id]
+                did_anything = True
+                ts = int(discord.utils.utcnow().timestamp())
+                await append_log_line(f"• {member.mention} 🗑️ removed by {actor.mention} <t:{ts}:t>")
+
+            # panel bijwerken
+            if did_anything:
+                ch = ST.panel_channel()
+                if ch:
+                    # probeer in-place; valt zo nodig terug op fresh panel
+                    await render_panel_in_place()
+            else:
+                # niets te doen: still update panel silently
+                await render_panel_in_place()
+
+        # ruim het commando op als het in het paneelkanaal stond
+        if isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == PANEL_CHANNEL_ID:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+
+    @bot.command(name="clearpanel")
+    async def clearpanel_cmd(ctx: commands.Context):
+        """
+        (Bestaat nog steeds, maar leeg alleen het HELE paneel.)
+        Gebruik normaal liever: !clear @user
         """
         ch = ST.panel_channel()
         if ch is None:
             return
         async with ST.lock:
-            # 1) state leeg
             ST.clear()
-            # 2) probeer het huidige panel-bericht te overschrijven (instant feedback)
-            await render_panel_in_place()
-            # 3) extra zeker: wis álle bot-berichten en plaats precies één nieuw paneel
-            await delete_old_panels(ch, limit=200)
-            await send_panel_bottom()
-            # 4) log thread garanderen (geen nieuwe aanmaken als al bestaat)
+            await ensure_single_panel()
             await get_or_create_log_thread()
 
-        # verwijder het commando als het in het paneelkanaal staat
         if isinstance(ctx.channel, discord.TextChannel) and ctx.channel.id == PANEL_CHANNEL_ID:
             try:
                 await ctx.message.delete()
