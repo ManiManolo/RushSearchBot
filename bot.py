@@ -229,7 +229,7 @@ def make_bot() -> commands.Bot:
     @bot.command(name="panel")
     async def cmd_panel(ctx: commands.Context):
         if ctx.channel.id != PANEL_CHANNEL_ID:
-            return await ctx.message.delete()
+            return
         await ensure_panel(ST)
         await ctx.message.delete()
 
@@ -241,9 +241,8 @@ def make_bot() -> commands.Bot:
         elif isinstance(ctx.channel, discord.Thread) and getattr(ctx.channel, "parent_id", None) == PANEL_CHANNEL_ID:
             chan_ok = True
         if not chan_ok:
-            return await ctx.message.delete()
+            return
 
-        # Geen member meegegeven → probeer via reply
         if member is None and ctx.message.reference:
             try:
                 ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
@@ -251,24 +250,23 @@ def make_bot() -> commands.Bot:
                     member = ref_msg.author
             except Exception:
                 pass
-
         if member is None:
-            return await ctx.message.delete()
+            await ctx.message.delete()
+            return
 
         actor = ctx.author
         changed = False
         async with ST.lock:
             if ST.current_user_id == member.id:
                 await stop_only(ST)
-                await add_log(ST, f"• <@{member.id}> ❌ cleared by <@{actor.id}> <t:{int(discord.utils.utcnow().timestamp())}:t>")
+                await add_log(ST, f"• <@{member.id}> ❌ by <@{actor.id}> <t:{int(discord.utils.utcnow().timestamp())}:t>")
                 changed = True
             if member.id in ST.queue:
                 ST.queue = [u for u in ST.queue if u != member.id]
-                await add_log(ST, f"• <@{member.id}> ❌ removed from queue by <@{actor.id}> <t:{int(discord.utils.utcnow().timestamp())}:t>")
+                await add_log(ST, f"• <@{member.id}> ❌ by <@{actor.id}> <t:{int(discord.utils.utcnow().timestamp())}:t>")
                 changed = True
             if changed:
                 await ensure_panel(ST)
-
         await ctx.message.delete()
 
     return bot
