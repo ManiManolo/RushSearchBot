@@ -1,4 +1,4 @@
-# bot.py — RushSearchBot: één panel + log in aparte thread (laatste 50)
+# bot.py — RushSearchBot: single panel + "log" thread + !clear @user
 import os
 import asyncio
 import logging
@@ -24,19 +24,15 @@ PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
 if not PANEL_CHANNEL_ID:
     raise RuntimeError("PANEL_CHANNEL_ID missing")
 
-LOG_THREAD_NAME = os.getenv("LOG_THREAD_NAME", "log").strip() or "log"
-
-# ---------- constants ----------
-LOG_LIMIT = 50  # laatste 50 in log
-
-# ---------- bot ----------
+# ---------- bot factory ----------
 def make_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.guilds = True
     intents.messages = True
     intents.message_content = True
-
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+    ALLOWED_NONE = discord.AllowedMentions.none()  # nooit pingen in panel/log
 
     # ----- state -----
     class PanelState:
@@ -49,10 +45,8 @@ def make_bot() -> commands.Bot:
             self.current_started_ts: Optional[int] = None  # unix seconds
             self.queue: List[int] = []
 
-            # log (samenvattingsbericht in een losse thread)
+            # log thread
             self.log_thread_id: Optional[int] = None
-            self.log_message_id: Optional[int] = None
-            self.logbook: List[Tuple[int, int]] = []  # (user_id, ts)
 
             self.lock = asyncio.Lock()
 
@@ -60,36 +54,15 @@ def make_bot() -> commands.Bot:
             ch = bot.get_channel(self.panel_channel_id)
             return ch if isinstance(ch, discord.TextChannel) else None
 
-        async def fetch_log_thread(self) -> Optional[discord.Thread]:
+        def log_thread(self) -> Optional[discord.Thread]:
             if self.log_thread_id:
                 th = bot.get_channel(self.log_thread_id)
-                if isinstance(th, discord.Thread):
-                    return th
-                self.log_thread_id = None
-            # Zoeken op naam
-            ch = self.panel_channel()
-            if not ch:
-                return None
-            try:
-                async for th in ch.threads(limit=50):
-                    if th.name.lower() == LOG_THREAD_NAME.lower():
-                        self.log_thread_id = th.id
-                        return th
-            except Exception:
-                pass
-            try:
-                async for th in ch.archived_threads(limit=50):
-                    if th.name.lower() == LOG_THREAD_NAME.lower():
-                        await th.unarchive()
-                        self.log_thread_id = th.id
-                        return th
-            except Exception:
-                pass
+                return th if isinstance(th, discord.Thread) else None
             return None
 
-    ST = PanelState(PANEL_CHANNEL_ID)
+    st = PanelState(PANEL_CHANNEL_ID)
 
-    # ----- UI -----
+    # ---------- UI ----------
     class SearchView(ui.View):
         def __init__(self, channel_id: int):
             super().__init__(timeout=None)
@@ -100,14 +73,13 @@ def make_bot() -> commands.Bot:
             self.add_item(ui.Button(label="🔁 Reset",  style=ButtonStyle.danger,    custom_id="rsb_reset"))
 
         async def interaction_check(self, interaction: Interaction) -> bool:
-            # Alleen knoppen in het panel-kanaal
             return interaction.channel and interaction.channel.id == self.channel_id
 
-    # ----- helpers: panel rendering -----
-    def panel_text(st: PanelState) -> str:
+    # ---------- panel rendering ----------
+    def panel_text() -> str:
         lines: List[str] = []
 
-        # Searching — toon alleen tijd (lokale tijd per kijker via Discord timestamp)
+        # Searching
         if st.current_user_id:
             if st.current_started_ts:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}> — <t:{st.current_started_ts}:t>")
@@ -119,7 +91,7 @@ def make_bot() -> commands.Bot:
         # lege regel
         lines.append("")
 
-        # Queue (elke gebruiker op nieuwe regel)
+        # Queue (elk op nieuwe regel)
         if st.queue:
             queue_lines = "\n".join(f"• <@{uid}>" for uid in st.queue)
             lines.append(f"🟡 **Queue**:\n{queue_lines}")
@@ -128,265 +100,298 @@ def make_bot() -> commands.Bot:
 
         return "\n".join(lines)
 
-    async def delete_other_panels(st: PanelState):
-        """Houd slechts 1 panel; verwijder oudere bot-panels in dit kanaal."""
-        ch = st.panel_channel()
-        if not ch:
-            return
-        try:
-            to_delete: List[discord.Message] = []
-            async for m in ch.history(limit=50):
-                if not m.author.bot:
-                    continue
-                if m.id == st.panel_message_id:
-                    continue
-                # Als een bot-bericht onze knoppen bevat: weg ermee
-                if m.components:
-                    for row in m.components:
-                        for comp in getattr(row, "children", []):
-                            if isinstance(comp, discord.Button) and str(comp.custom_id).startswith("rsb_"):
-                                to_delete.append(m)
-                                break
-                # Val-back: herken aan header
-                if m.content.startswith("🟦 **Searching**") or m.content.startswith("🔎 **Searching**"):
-                    to_delete.append(m)
-            if to_delete:
-                for msg in to_delete:
-                    try:
-                        await msg.delete()
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.warning("delete_other_panels failed: %r", e)
-
-    async def send_panel_bottom(st: PanelState):
+    async def send_panel_bottom():
         ch = st.panel_channel()
         if not ch:
             raise RuntimeError(f"Panel channel {st.panel_channel_id} not found")
-        # verwijder huidig panel als-ie bestaat
+
+        # verwijder vorig paneel (als we het id weten)
         if st.panel_message_id:
             try:
                 old = await ch.fetch_message(st.panel_message_id)
                 await old.delete()
             except Exception:
                 pass
-        # nieuw panel onderaan
-        msg = await ch.send(panel_text(st), view=SearchView(st.panel_channel_id))
+
+        msg = await ch.send(panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
         st.panel_message_id = msg.id
-        await delete_other_panels(st)
-        await ensure_log_thread_and_message(st)
         return msg
 
-    async def ensure_panel(st: PanelState):
+    async def ensure_single_panel():
+        """Zoek recente panel-berichten van de bot en behoud er maar 1."""
         ch = st.panel_channel()
         if not ch:
             return
-        if st.panel_message_id:
-            try:
-                msg = await ch.fetch_message(st.panel_message_id)
-                await msg.edit(content=panel_text(st), view=SearchView(st.panel_channel_id))
-                await delete_other_panels(st)
-                await ensure_log_thread_and_message(st)
-                return
-            except Exception:
-                # als niet te vinden: maak ‘m opnieuw
-                pass
-        await send_panel_bottom(st)
-
-    async def edit_panel_from_interaction(inter: Interaction, st: PanelState):
-        # probeer te editen, lukt dat niet -> onderaan opnieuw plaatsen
+        candidates: List[discord.Message] = []
         try:
-            await inter.response.edit_message(content=panel_text(st), view=SearchView(st.panel_channel_id))
-        except discord.NotFound:
-            await send_panel_bottom(st)
-            try:
-                await inter.response.defer()
-            except Exception:
-                pass
-        except Exception:
-            try:
-                await inter.response.defer()
-            except Exception:
-                pass
-
-    # ----- helpers: log thread -----
-    def fmt_hhmm(ts_unix: int) -> str:
-        # Discord gebruikt viewer-lokale tijd als we <t:..:t> gebruiken,
-        # maar in de log willen we vaste HH:MM tekst; neem UTC-agnostisch simpel:
-        dt = discord.utils.utcnow().fromtimestamp(ts_unix, tz=None)  # type: ignore
-        # bovenstaande geeft naïef object; pak HH:MM van UTC; we willen alleen tijdnotatie
-        return dt.strftime("%H:%M")
-
-    async def ensure_log_thread_and_message(st: PanelState):
-        """Zorg dat de thread 'log' bestaat en er één samenvattingsbericht in staat."""
-        ch = st.panel_channel()
-        if not ch:
-            return
-
-        thread = await st.fetch_log_thread()
-        if not thread:
-            try:
-                thread = await ch.create_thread(name=LOG_THREAD_NAME, type=discord.ChannelType.public_thread)
-                st.log_thread_id = thread.id
-                log.info("Created log thread #%s in channel %s", LOG_THREAD_NAME, ch.id)
-            except discord.Forbidden:
-                log.error("No permission to create thread in channel %s", ch.id)
-                return
-            except Exception as e:
-                log.error("Failed to create thread: %r", e)
-                return
-
-        # check of log-message er is
-        if st.log_message_id:
-            try:
-                await thread.fetch_message(st.log_message_id)
-                return
-            except Exception:
-                st.log_message_id = None
-        try:
-            m = await thread.send("📜 **Log**\n*(empty)*")
-            st.log_message_id = m.id
-        except Exception as e:
-            log.warning("Couldn't send log summary: %r", e)
-
-    async def update_log_summary(st: PanelState):
-        thread = await st.fetch_log_thread()
-        if not thread:
-            await ensure_log_thread_and_message(st)
-            thread = await st.fetch_log_thread()
-            if not thread:
-                return
-
-        await ensure_log_thread_and_message(st)
-
-        try:
-            msg = await thread.fetch_message(st.log_message_id)  # type: ignore[arg-type]
-        except Exception:
-            m2 = await thread.send("📜 **Log**\n*(empty)*")
-            st.log_message_id = m2.id
-            msg = m2
-
-        last = st.logbook[-LOG_LIMIT:][::-1]  # nieuwste boven
-        if last:
-            # geen code block -> mentions blijven klikbaar
-            rows = [f"• <@{uid}> — {fmt_hhmm(ts)}" for uid, ts in last]
-            text = "📜 **Log**\n" + "\n".join(rows)
-        else:
-            text = "📜 **Log**\n*(empty)*"
-
-        try:
-            await msg.edit(content=text)
+            async for m in ch.history(limit=50):
+                if m.author.id == bot.user.id and isinstance(m.components, list):
+                    # ruwe check: onze panel-tekst bevat 'Searching' en 'Queue' en heeft knoppen
+                    if "Searching" in m.content and "Queue" in m.content and m.components:
+                        candidates.append(m)
         except Exception:
             pass
 
-    # ----- state ops -----
-    async def start_for(st: PanelState, user_id: int):
+        candidates.sort(key=lambda m: m.created_at)  # oud -> nieuw
+        if candidates:
+            # houd enkel de nieuwste
+            latest = candidates[-1]
+            for extra in candidates[:-1]:
+                try:
+                    await extra.delete()
+                except Exception:
+                    pass
+            st.panel_message_id = latest.id
+            try:
+                await latest.edit(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
+            except Exception:
+                # als editen niet kan, maak een nieuwe onderaan
+                await send_panel_bottom()
+        else:
+            await send_panel_bottom()
+
+    async def edit_panel_from_interaction(inter: Interaction):
+        # probeer te editen, anders opnieuw onderaan
+        try:
+            await inter.response.edit_message(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
+        except discord.NotFound:
+            await send_panel_bottom()
+            try:
+                await inter.response.defer()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                await inter.response.defer()
+            except Exception:
+                pass
+
+    # ---------- log thread ----------
+    async def ensure_log_thread() -> Optional[discord.Thread]:
+        """Zoek of maak een thread 'log' onder het panel-kanaal, en hergebruik die ook na herstart."""
+        ch = st.panel_channel()
+        if not ch:
+            return None
+
+        # 1) als we een id hebben, probeer op te halen
+        if st.log_thread_id:
+            th = st.log_thread()
+            if th:
+                return th
+            else:
+                st.log_thread_id = None  # ongeldig geworden
+
+        # 2) kijk actieve threads in dit kanaal
+        for th in ch.threads:
+            if isinstance(th, discord.Thread) and th.name.lower() == "log":
+                st.log_thread_id = th.id
+                # als gearchiveerd, unarchive
+                if th.archived:
+                    try:
+                        await th.edit(archived=False, locked=False)
+                    except Exception:
+                        pass
+                return th
+
+        # 3) kijk gearchiveerde public threads
+        try:
+            archived = []
+            async for th in ch.archived_threads(limit=100, private=False):
+                archived.append(th)
+            for th in archived:
+                if th.name.lower() == "log":
+                    st.log_thread_id = th.id
+                    try:
+                        await th.edit(archived=False, locked=False)
+                    except Exception:
+                        pass
+                    return th
+        except Exception:
+            pass
+
+        # 4) bestaat niet: maak nieuwe thread
+        # We hechten de thread aan het huidige (of nieuwe) panel-bericht
+        base_msg: Optional[discord.Message] = None
+        if st.panel_message_id:
+            try:
+                base_msg = await ch.fetch_message(st.panel_message_id)
+            except Exception:
+                base_msg = None
+        if base_msg is None:
+            base_msg = await send_panel_bottom()
+
+        try:
+            th = await base_msg.create_thread(name="log", auto_archive_duration=10080)  # 7 dagen
+            st.log_thread_id = th.id
+            return th
+        except Exception as e:
+            log.warning("Failed to create/find log thread: %r", e)
+            return None
+
+    async def log_line(text: str):
+        th = await ensure_log_thread()
+        if not th:
+            return
+        try:
+            await th.send(text, allowed_mentions=ALLOWED_NONE)
+        except Exception:
+            pass
+
+    def ts_now() -> int:
+        return int(discord.utils.utcnow().timestamp())
+
+    # ---------- state ops ----------
+    async def start_for(user_id: int):
         st.current_user_id = user_id
-        st.current_started_ts = int(discord.utils.utcnow().timestamp())
+        st.current_started_ts = ts_now()
         try:
             st.queue.remove(user_id)
         except ValueError:
             pass
 
-    async def stop_only(st: PanelState):
+    async def stop_only():
         st.current_user_id = None
         st.current_started_ts = None
 
-    # ----- events -----
+    # ---------- events ----------
     @bot.event
     async def on_ready():
         log.info("✅ Logged in as %s (id=%s)", getattr(bot.user, "name", "?"), getattr(bot.user, "id", "?"))
-        # persistent view is niet strikt nodig omdat we on_interaction gebruiken,
-        # maar toevoegen kan geen kwaad als bots later herstarten met bestaand panel:
-        bot.add_view(SearchView(PANEL_CHANNEL_ID))
-        await ensure_panel(ST)
-        await ensure_log_thread_and_message(ST)
-        await update_log_summary(ST)
-        log.info("Panel ensured in channel %s; log thread ensured: '%s'", PANEL_CHANNEL_ID, LOG_THREAD_NAME)
+        # paneel zeker stellen en één houden
+        await ensure_single_panel()
+        # log thread zeker stellen
+        await ensure_log_thread()
+        log.info("Panel ensured in channel %s; log thread ensured (name='log')", PANEL_CHANNEL_ID)
 
     @bot.event
     async def on_message(message: discord.Message):
-        # panel onderaan houden in panel-kanaal
+        # paneel onderaan houden in het paneel-kanaal
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
             return
         if message.channel.id != PANEL_CHANNEL_ID:
             return
-        try:
-            async with ST.lock:
-                await send_panel_bottom(ST)
-        except Exception as e:
-            log.warning("Move panel failed: %r", e)
+        async with st.lock:
+            await send_panel_bottom()
 
     @bot.event
     async def on_interaction(interaction: Interaction):
         if interaction.type != discord.InteractionType.component:
             return
-        cid = (interaction.data or {}).get("custom_id")  # type: ignore[assignment]
+        data = getattr(interaction, "data", {}) or {}
+        cid = data.get("custom_id")
         if cid not in {"rsb_search", "rsb_found", "rsb_next", "rsb_reset"}:
             return
         ch = interaction.channel
-        if not isinstance(ch, discord.TextChannel):
-            return
-        if ch.id != PANEL_CHANNEL_ID:
+        if not isinstance(ch, discord.TextChannel) or ch.id != PANEL_CHANNEL_ID:
             return
 
         if cid == "rsb_search":
-            await handle_search(interaction, ST)
+            await handle_search(interaction)
         elif cid == "rsb_found":
-            await handle_found(interaction, ST)
+            await handle_found(interaction)
         elif cid == "rsb_next":
-            await handle_next(interaction, ST)
+            await handle_next(interaction)
         elif cid == "rsb_reset":
-            await handle_reset(interaction, ST)
+            await handle_reset(interaction)
 
-    # ----- handlers -----
-    async def handle_search(inter: Interaction, st: PanelState):
+    # ---------- handlers ----------
+    async def handle_search(inter: Interaction):
         user = inter.user
         async with st.lock:
             if st.current_user_id is None:
-                await start_for(st, user.id)
+                await start_for(user.id)
             else:
-                # voeg toe aan wachtrij als nog niet erin en niet al aan het zoeken
                 if user.id != st.current_user_id and user.id not in st.queue:
                     st.queue.append(user.id)
-            await edit_panel_from_interaction(inter, st)
+            await edit_panel_from_interaction(inter)
 
-    async def handle_found(inter: Interaction, st: PanelState):
+    async def handle_found(inter: Interaction):
         user = inter.user
         async with st.lock:
             if st.current_user_id and st.current_user_id == user.id:
-                ts = int(discord.utils.utcnow().timestamp())
-                st.logbook.append((user.id, ts))
-                if len(st.logbook) > LOG_LIMIT:
-                    st.logbook = st.logbook[-LOG_LIMIT:]
-                await stop_only(st)
-                await update_log_summary(st)  # update in log-thread
-            await edit_panel_from_interaction(inter, st)
+                ts = ts_now()
+                await log_line(f"• <@{user.id}> ✅ <t:{ts}:t>")
+                await stop_only()  # geen auto-start
+            await edit_panel_from_interaction(inter)
 
-    async def handle_next(inter: Interaction, st: PanelState):
+    async def handle_next(inter: Interaction):
         user = inter.user
         async with st.lock:
             if user.id != st.current_user_id and user.id not in st.queue:
                 st.queue.append(user.id)
-            await edit_panel_from_interaction(inter, st)
+            await edit_panel_from_interaction(inter)
 
-    async def handle_reset(inter: Interaction, st: PanelState):
+    async def handle_reset(inter: Interaction):
+        actor = inter.user
         async with st.lock:
             if st.current_user_id:
-                await stop_only(st)  # géén auto-start
-            await edit_panel_from_interaction(inter, st)
+                target = st.current_user_id
+                await stop_only()  # geen auto-start
+                ts = ts_now()
+                await log_line(f"• <@{target}> ❌ by <@{actor.id}> <t:{ts}:t>")
+            await edit_panel_from_interaction(inter)
 
-    # ----- optional command -----
+    # ---------- commands ----------
     @bot.command()
     async def panel(ctx: commands.Context):
-        """Handmatig panel opnieuw plaatsen (alleen in panel-kanaal)."""
-        if ctx.channel.id != PANEL_CHANNEL_ID:
+        """Zet (opnieuw) precies één panel onderaan het kanaal."""
+        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
             return
-        await ensure_panel(ST)
-        await ensure_log_thread_and_message(ST)
-        await update_log_summary(ST)
+        async with st.lock:
+            await ensure_single_panel()
+            await ensure_log_thread()
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+    @bot.command(name="clear")
+    async def clear_user(ctx: commands.Context, member: Optional[discord.Member] = None):
+        """
+        Verwijder specifiek iemand uit de queue of stop de huidige zoeker.
+        Gebruik: !clear @user
+        """
+        if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
+            return
+        if member is None:
+            # geen user meegegeven; niets doen (bewust stil)
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            return
+
+        actor = ctx.author
+        target_id = member.id
+
+        async with st.lock:
+            changed = False
+            # als target nu zoekt -> stop
+            if st.current_user_id == target_id:
+                await stop_only()
+                ts = ts_now()
+                await log_line(f"• <@{target_id}> ❌ by <@{actor.id}> <t:{ts}:t>")
+                changed = True
+            # verwijder uit queue
+            if target_id in st.queue:
+                st.queue = [uid for uid in st.queue if uid != target_id]
+                ts = ts_now()
+                await log_line(f"• <@{target_id}> ❌ by <@{actor.id}> <t:{ts}:t>")
+                changed = True
+
+            if changed:
+                # paneel bijwerken
+                ch = st.panel_channel()
+                if ch and st.panel_message_id:
+                    try:
+                        msg = await ch.fetch_message(st.panel_message_id)
+                        await msg.edit(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
+                    except Exception:
+                        await send_panel_bottom()
+
+        # verwijder het command-bericht voor clean kanaal
         try:
             await ctx.message.delete()
         except Exception:
