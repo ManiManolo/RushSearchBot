@@ -1,8 +1,8 @@
-# bot.py — RushSearchBot: single panel + "log" thread + !clear @user
+# bot.py — RushSearchBot
 import os
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import discord
 from discord.ext import commands
@@ -24,35 +24,29 @@ PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0"))
 if not PANEL_CHANNEL_ID:
     raise RuntimeError("PANEL_CHANNEL_ID missing")
 
+
 # ---------- bot factory ----------
 def make_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.guilds = True
     intents.messages = True
-    intents.message_content = True  # nodig voor commands in hetzelfde kanaal
-    intents.members = True          # helpt bij @mention -> Member converter
+    intents.message_content = True
+    intents.members = True  # nodig voor @mention -> Member converter
 
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-    ALLOWED_NONE = discord.AllowedMentions.none()  # nooit pingen in panel/log
+    ALLOWED_NONE = discord.AllowedMentions.none()
 
     # ----- state -----
     class PanelState:
         def __init__(self, panel_channel_id: int):
             self.panel_channel_id: int = panel_channel_id
-
-            # panel
             self.panel_message_id: Optional[int] = None
             self.current_user_id: Optional[int] = None
-            self.current_started_ts: Optional[int] = None  # unix seconds
+            self.current_started_ts: Optional[int] = None
             self.queue: List[int] = []
-
-            # log thread
             self.log_thread_id: Optional[int] = None
-
-            # debounce taak voor panel-refresh
             self.refresh_task: Optional[asyncio.Task] = None
-
             self.lock = asyncio.Lock()
 
         def panel_channel(self) -> Optional[discord.TextChannel]:
@@ -72,10 +66,10 @@ def make_bot() -> commands.Bot:
         def __init__(self, channel_id: int):
             super().__init__(timeout=None)
             self.channel_id = channel_id
-            self.add_item(ui.Button(label="🔵 Search", style=ButtonStyle.primary,  custom_id="rsb_search"))
-            self.add_item(ui.Button(label="✅ Found",  style=ButtonStyle.success,  custom_id="rsb_found"))
-            self.add_item(ui.Button(label="🟡 Next",   style=ButtonStyle.secondary, custom_id="rsb_next"))
-            self.add_item(ui.Button(label="🔁 Reset",  style=ButtonStyle.danger,    custom_id="rsb_reset"))
+            self.add_item(ui.Button(label="🔵 Search", style=ButtonStyle.primary, custom_id="rsb_search"))
+            self.add_item(ui.Button(label="✅ Found", style=ButtonStyle.success, custom_id="rsb_found"))
+            self.add_item(ui.Button(label="🟡 Next", style=ButtonStyle.secondary, custom_id="rsb_next"))
+            self.add_item(ui.Button(label="🔁 Reset", style=ButtonStyle.danger, custom_id="rsb_reset"))
 
         async def interaction_check(self, interaction: Interaction) -> bool:
             return interaction.channel and interaction.channel.id == self.channel_id
@@ -84,7 +78,6 @@ def make_bot() -> commands.Bot:
     def panel_text() -> str:
         lines: List[str] = []
 
-        # Searching
         if st.current_user_id:
             if st.current_started_ts:
                 lines.append(f"🔎 **Searching**: <@{st.current_user_id}> — <t:{st.current_started_ts}:t>")
@@ -93,10 +86,8 @@ def make_bot() -> commands.Bot:
         else:
             lines.append("🟦 **Searching**: *nobody*")
 
-        # lege regel
         lines.append("")
 
-        # Queue (elk op nieuwe regel)
         if st.queue:
             queue_lines = "\n".join(f"• <@{uid}>" for uid in st.queue)
             lines.append(f"🟡 **Queue**:\n{queue_lines}")
@@ -106,12 +97,10 @@ def make_bot() -> commands.Bot:
         return "\n".join(lines)
 
     async def send_panel_bottom():
-        """Verwijder het vorige paneel (indien bekend) en plaats een NIEUWE onderaan."""
         ch = st.panel_channel()
         if not ch:
             raise RuntimeError(f"Panel channel {st.panel_channel_id} not found")
 
-        # verwijder vorig paneel (als we het id weten)
         if st.panel_message_id:
             try:
                 old = await ch.fetch_message(st.panel_message_id)
@@ -124,7 +113,6 @@ def make_bot() -> commands.Bot:
         return msg
 
     async def ensure_single_panel():
-        """Zoek recente panel-berichten van de bot en behoud er maar 1 (bij startup/command)."""
         ch = st.panel_channel()
         if not ch:
             return
@@ -137,7 +125,7 @@ def make_bot() -> commands.Bot:
         except Exception:
             pass
 
-        candidates.sort(key=lambda m: m.created_at)  # oud -> nieuw
+        candidates.sort(key=lambda m: m.created_at)
         if candidates:
             latest = candidates[-1]
             for extra in candidates[:-1]:
@@ -154,7 +142,6 @@ def make_bot() -> commands.Bot:
             await send_panel_bottom()
 
     async def edit_panel_force():
-        """Forceer altijd een update van het panel (nieuw als edit faalt)."""
         ch = st.panel_channel()
         if ch and st.panel_message_id:
             try:
@@ -166,7 +153,6 @@ def make_bot() -> commands.Bot:
         await send_panel_bottom()
 
     async def edit_panel_from_interaction(inter: Interaction):
-        """Probeer het bestaande paneel te editen vanuit een button-interactie; anders herplaats."""
         try:
             await inter.response.edit_message(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
         except discord.NotFound:
@@ -181,15 +167,13 @@ def make_bot() -> commands.Bot:
             except Exception:
                 pass
 
-    # ---------- debounce voor paneel refresh ----------
     def schedule_panel_refresh():
-        """Bundel snelle chatberichten tot één refresh (paneel altijd onderaan, maar rate-limit vriendelijk)."""
         if st.refresh_task and not st.refresh_task.done():
-            return  # al gepland
+            return
 
         async def _do():
             try:
-                await asyncio.sleep(0.3)  # kleine debounce
+                await asyncio.sleep(0.3)
                 async with st.lock:
                     await send_panel_bottom()
             finally:
@@ -287,19 +271,15 @@ def make_bot() -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message):
-        # Alleen berichten in het panel-kanaal triggeren een refresh (debounced)
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
             return
         if message.channel.id != PANEL_CHANNEL_ID:
-            # laat commands buiten panel-kanaal wel door lopen
             await bot.process_commands(message)
             return
 
         schedule_panel_refresh()
-
-        # HEEL BELANGRIJK: laat commands door, anders werkt !panel / !clear niet
         await bot.process_commands(message)
 
     @bot.event
@@ -363,8 +343,11 @@ def make_bot() -> commands.Bot:
     # ---------- commands ----------
     @bot.command()
     async def panel(ctx: commands.Context):
-        """Zet (opnieuw) precies één panel onderaan het kanaal."""
         if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
             return
         async with st.lock:
             await ensure_single_panel()
@@ -376,12 +359,7 @@ def make_bot() -> commands.Bot:
 
     @bot.command(name="clear")
     async def clear_user(ctx: commands.Context, member: Optional[discord.Member] = None):
-        """
-        Verwijder specifiek iemand uit de queue of stop de huidige zoeker.
-        Gebruik: !clear @user
-        """
         if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
-            # command alleen toegestaan in panel-kanaal
             try:
                 await ctx.message.delete()
             except Exception:
@@ -389,7 +367,6 @@ def make_bot() -> commands.Bot:
             return
 
         actor = ctx.author
-        # Als je perse @mention wilt, laat None dan gewoon niks doen:
         if member is None:
             try:
                 await ctx.message.delete()
@@ -400,7 +377,6 @@ def make_bot() -> commands.Bot:
         target_id = member.id
 
         async with st.lock:
-            # dedupe: bepaal eerst wat er verandert
             cleared_current = (st.current_user_id == target_id)
             was_in_queue = (target_id in st.queue)
             changed = cleared_current or was_in_queue
@@ -412,7 +388,8 @@ def make_bot() -> commands.Bot:
 
             if changed:
                 ts = ts_now()
-                await log_line(f"• <@{target_id}> ❌ by <@{actor.id}> <t:{ts}:t>")
+                # 🗑️ in plaats van ❌
+                await log_line(f"• <@{target_id}> 🗑️ by <@{actor.id}> <t:{ts}:t>")
                 await edit_panel_force()
 
         try:
