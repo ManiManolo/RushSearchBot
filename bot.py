@@ -29,7 +29,9 @@ def make_bot() -> commands.Bot:
     intents = discord.Intents.default()
     intents.guilds = True
     intents.messages = True
-    intents.message_content = True
+    intents.message_content = True  # nodig voor commands in hetzelfde kanaal
+    intents.members = True          # helpt bij @mention -> Member converter
+
     bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
     ALLOWED_NONE = discord.AllowedMentions.none()  # nooit pingen in panel/log
@@ -47,6 +49,9 @@ def make_bot() -> commands.Bot:
 
             # log thread
             self.log_thread_id: Optional[int] = None
+
+            # debounce taak voor panel-refresh
+            self.refresh_task: Optional[asyncio.Task] = None
 
             self.lock = asyncio.Lock()
 
@@ -101,6 +106,7 @@ def make_bot() -> commands.Bot:
         return "\n".join(lines)
 
     async def send_panel_bottom():
+        """Verwijder het vorige paneel (indien bekend) en plaats een NIEUWE onderaan."""
         ch = st.panel_channel()
         if not ch:
             raise RuntimeError(f"Panel channel {st.panel_channel_id} not found")
@@ -118,7 +124,7 @@ def make_bot() -> commands.Bot:
         return msg
 
     async def ensure_single_panel():
-        """Zoek recente panel-berichten van de bot en behoud er maar 1."""
+        """Zoek recente panel-berichten van de bot en behoud er maar 1 (bij startup/command)."""
         ch = st.panel_channel()
         if not ch:
             return
@@ -126,7 +132,6 @@ def make_bot() -> commands.Bot:
         try:
             async for m in ch.history(limit=50):
                 if m.author.id == bot.user.id and isinstance(m.components, list):
-                    # ruwe check: onze panel-tekst bevat 'Searching' en 'Queue' en heeft knoppen
                     if "Searching" in m.content and "Queue" in m.content and m.components:
                         candidates.append(m)
         except Exception:
@@ -134,7 +139,6 @@ def make_bot() -> commands.Bot:
 
         candidates.sort(key=lambda m: m.created_at)  # oud -> nieuw
         if candidates:
-            # houd enkel de nieuwste
             latest = candidates[-1]
             for extra in candidates[:-1]:
                 try:
@@ -145,13 +149,24 @@ def make_bot() -> commands.Bot:
             try:
                 await latest.edit(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
             except Exception:
-                # als editen niet kan, maak een nieuwe onderaan
                 await send_panel_bottom()
         else:
             await send_panel_bottom()
 
+    async def edit_panel_force():
+        """Forceer altijd een update van het panel (nieuw als edit faalt)."""
+        ch = st.panel_channel()
+        if ch and st.panel_message_id:
+            try:
+                msg = await ch.fetch_message(st.panel_message_id)
+                await msg.edit(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
+                return
+            except Exception:
+                pass
+        await send_panel_bottom()
+
     async def edit_panel_from_interaction(inter: Interaction):
-        # probeer te editen, anders opnieuw onderaan
+        """Probeer het bestaande paneel te editen vanuit een button-interactie; anders herplaats."""
         try:
             await inter.response.edit_message(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
         except discord.NotFound:
@@ -166,26 +181,38 @@ def make_bot() -> commands.Bot:
             except Exception:
                 pass
 
+    # ---------- debounce voor paneel refresh ----------
+    def schedule_panel_refresh():
+        """Bundel snelle chatberichten tot één refresh (paneel altijd onderaan, maar rate-limit vriendelijk)."""
+        if st.refresh_task and not st.refresh_task.done():
+            return  # al gepland
+
+        async def _do():
+            try:
+                await asyncio.sleep(0.3)  # kleine debounce
+                async with st.lock:
+                    await send_panel_bottom()
+            finally:
+                st.refresh_task = None
+
+        st.refresh_task = asyncio.create_task(_do())
+
     # ---------- log thread ----------
     async def ensure_log_thread() -> Optional[discord.Thread]:
-        """Zoek of maak een thread 'log' onder het panel-kanaal, en hergebruik die ook na herstart."""
         ch = st.panel_channel()
         if not ch:
             return None
 
-        # 1) als we een id hebben, probeer op te halen
         if st.log_thread_id:
             th = st.log_thread()
             if th:
                 return th
             else:
-                st.log_thread_id = None  # ongeldig geworden
+                st.log_thread_id = None
 
-        # 2) kijk actieve threads in dit kanaal
         for th in ch.threads:
             if isinstance(th, discord.Thread) and th.name.lower() == "log":
                 st.log_thread_id = th.id
-                # als gearchiveerd, unarchive
                 if th.archived:
                     try:
                         await th.edit(archived=False, locked=False)
@@ -193,7 +220,6 @@ def make_bot() -> commands.Bot:
                         pass
                 return th
 
-        # 3) kijk gearchiveerde public threads
         try:
             archived = []
             async for th in ch.archived_threads(limit=100, private=False):
@@ -209,8 +235,6 @@ def make_bot() -> commands.Bot:
         except Exception:
             pass
 
-        # 4) bestaat niet: maak nieuwe thread
-        # We hechten de thread aan het huidige (of nieuwe) panel-bericht
         base_msg: Optional[discord.Message] = None
         if st.panel_message_id:
             try:
@@ -221,7 +245,7 @@ def make_bot() -> commands.Bot:
             base_msg = await send_panel_bottom()
 
         try:
-            th = await base_msg.create_thread(name="log", auto_archive_duration=10080)  # 7 dagen
+            th = await base_msg.create_thread(name="log", auto_archive_duration=10080)
             st.log_thread_id = th.id
             return th
         except Exception as e:
@@ -257,23 +281,26 @@ def make_bot() -> commands.Bot:
     @bot.event
     async def on_ready():
         log.info("✅ Logged in as %s (id=%s)", getattr(bot.user, "name", "?"), getattr(bot.user, "id", "?"))
-        # paneel zeker stellen en één houden
         await ensure_single_panel()
-        # log thread zeker stellen
         await ensure_log_thread()
         log.info("Panel ensured in channel %s; log thread ensured (name='log')", PANEL_CHANNEL_ID)
 
     @bot.event
     async def on_message(message: discord.Message):
-        # paneel onderaan houden in het paneel-kanaal
+        # Alleen berichten in het panel-kanaal triggeren een refresh (debounced)
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.TextChannel):
             return
         if message.channel.id != PANEL_CHANNEL_ID:
+            # laat commands buiten panel-kanaal wel door lopen
+            await bot.process_commands(message)
             return
-        async with st.lock:
-            await send_panel_bottom()
+
+        schedule_panel_refresh()
+
+        # HEEL BELANGRIJK: laat commands door, anders werkt !panel / !clear niet
+        await bot.process_commands(message)
 
     @bot.event
     async def on_interaction(interaction: Interaction):
@@ -313,7 +340,7 @@ def make_bot() -> commands.Bot:
             if st.current_user_id and st.current_user_id == user.id:
                 ts = ts_now()
                 await log_line(f"• <@{user.id}> ✅ <t:{ts}:t>")
-                await stop_only()  # geen auto-start
+                await stop_only()
             await edit_panel_from_interaction(inter)
 
     async def handle_next(inter: Interaction):
@@ -328,7 +355,7 @@ def make_bot() -> commands.Bot:
         async with st.lock:
             if st.current_user_id:
                 target = st.current_user_id
-                await stop_only()  # geen auto-start
+                await stop_only()
                 ts = ts_now()
                 await log_line(f"• <@{target}> ❌ by <@{actor.id}> <t:{ts}:t>")
             await edit_panel_from_interaction(inter)
@@ -354,9 +381,7 @@ def make_bot() -> commands.Bot:
         Gebruik: !clear @user
         """
         if not isinstance(ctx.channel, discord.TextChannel) or ctx.channel.id != PANEL_CHANNEL_ID:
-            return
-        if member is None:
-            # geen user meegegeven; niets doen (bewust stil)
+            # command alleen toegestaan in panel-kanaal
             try:
                 await ctx.message.delete()
             except Exception:
@@ -364,34 +389,32 @@ def make_bot() -> commands.Bot:
             return
 
         actor = ctx.author
+        # Als je perse @mention wilt, laat None dan gewoon niks doen:
+        if member is None:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            return
+
         target_id = member.id
 
         async with st.lock:
-            changed = False
-            # als target nu zoekt -> stop
-            if st.current_user_id == target_id:
+            # dedupe: bepaal eerst wat er verandert
+            cleared_current = (st.current_user_id == target_id)
+            was_in_queue = (target_id in st.queue)
+            changed = cleared_current or was_in_queue
+
+            if cleared_current:
                 await stop_only()
-                ts = ts_now()
-                await log_line(f"• <@{target_id}> ❌ by <@{actor.id}> <t:{ts}:t>")
-                changed = True
-            # verwijder uit queue
-            if target_id in st.queue:
+            if was_in_queue:
                 st.queue = [uid for uid in st.queue if uid != target_id]
-                ts = ts_now()
-                await log_line(f"• <@{target_id}> ❌ by <@{actor.id}> <t:{ts}:t>")
-                changed = True
 
             if changed:
-                # paneel bijwerken
-                ch = st.panel_channel()
-                if ch and st.panel_message_id:
-                    try:
-                        msg = await ch.fetch_message(st.panel_message_id)
-                        await msg.edit(content=panel_text(), view=SearchView(st.panel_channel_id), allowed_mentions=ALLOWED_NONE)
-                    except Exception:
-                        await send_panel_bottom()
+                ts = ts_now()
+                await log_line(f"• <@{target_id}> ❌ by <@{actor.id}> <t:{ts}:t>")
+                await edit_panel_force()
 
-        # verwijder het command-bericht voor clean kanaal
         try:
             await ctx.message.delete()
         except Exception:
